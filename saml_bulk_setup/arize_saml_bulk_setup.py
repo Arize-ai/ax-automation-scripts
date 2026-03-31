@@ -70,6 +70,27 @@ _CREATE_ORGANIZATION = gql("""
 """)
 
 # arize_toolkit has no SAML operations
+_CREATE_SAML_IDP = gql("""
+    mutation createSAMLIdP($input: CreateSAMLIdPInput!) {
+        createSAMLIdP(input: $input) {
+            idp {
+                id
+                roleMappings {
+                    id
+                    attributesMap
+                    spaceRolesMap
+                    isAccountAdmin
+                    orgRole {
+                        orgId
+                        roleId
+                    }
+                }
+            }
+            error
+        }
+    }
+""")
+
 _GET_SAML_IDP = gql("""
     query getSAMLIdP {
         account {
@@ -77,6 +98,9 @@ _GET_SAML_IDP = gql("""
                 edges {
                     node {
                         id
+                        emailDomainsList {
+                            domain
+                        }
                         roleMappings {
                             id
                             attributesMap
@@ -113,6 +137,7 @@ _UPDATE_SAML_IDP = gql("""
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
 
+
 @dataclass
 class RowResult:
     row_number: int
@@ -128,9 +153,11 @@ class RowResult:
 @dataclass
 class PendingSAMLMapping:
     """A new SAML role mapping queued for creation, tied back to a CSV row."""
+
     row_number: int
+    org_id: str
     space_id: str
-    space_role: str   # translated: "admin" | "member" | "readOnly"
+    space_role: str  # translated: "admin" | "member" | "readOnly"
     attr_name: str
     attr_value: str
 
@@ -157,10 +184,13 @@ def with_retry(
             return fn()
         except Exception as exc:
             if _is_rate_limit_error(exc) and attempt < MAX_RETRIES - 1:
-                wait = INITIAL_BACKOFF * (2 ** attempt)
+                wait = INITIAL_BACKOFF * (2**attempt)
                 logger.warning(
                     "Rate limit hit for '%s' (attempt %d/%d). Retrying in %.1fs…",
-                    operation_name, attempt + 1, MAX_RETRIES, wait,
+                    operation_name,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    wait,
                 )
                 time.sleep(wait)
                 last_exc = exc
@@ -173,6 +203,7 @@ def with_retry(
 
 # ─── Main runner ─────────────────────────────────────────────────────────────
 
+
 class BulkSetupRunner:
     def __init__(
         self,
@@ -180,6 +211,9 @@ class BulkSetupRunner:
         dry_run: bool,
         verbose: bool,
         arize_app_url: str = ARIZE_APP_URL,
+        saml_metadata_url: Optional[str] = None,
+        saml_metadata_xml: Optional[str] = None,
+        email_domains: Optional[list[str]] = None,
     ) -> None:
         self.dry_run = dry_run
 
@@ -202,14 +236,23 @@ class BulkSetupRunner:
         self._gql = self._toolkit._graphql_client
 
         # In-memory caches
-        self._org_cache: dict[str, str] = {}            # org_name → org_id
+        self._org_cache: dict[str, str] = {}  # org_name → org_id
         self._org_cache_loaded = False
-        self._space_cache: dict[tuple[str, str], str] = {}  # (org_id, space_name) → space_id
-        self._spaces_loaded_for: set[str] = set()        # org_ids already fetched
+        self._space_cache: dict[
+            tuple[str, str], str
+        ] = {}  # (org_id, space_name) → space_id
+        self._spaces_loaded_for: set[str] = set()  # org_ids already fetched
+
+        # SAML IdP creation params (used if no IdP exists yet)
+        self._saml_metadata_url = saml_metadata_url
+        self._saml_metadata_xml = saml_metadata_xml
+        self._email_domains = email_domains or []
 
         # SAML state — loaded once on first SAML operation
         self._saml_idp_id: Optional[str] = None
+        self._saml_idp_needs_creation: bool = False  # True when no IdP found yet
         self._saml_existing_mappings: list[dict] = []
+        self._saml_existing_email_domains: list[str] = []  # re-sent on updateSAMLIdP
         self._saml_pending: list[PendingSAMLMapping] = []
 
         # Run counters
@@ -236,7 +279,7 @@ class BulkSetupRunner:
     def _load_all_organizations(self) -> None:
         if self._org_cache_loaded:
             return
-        self.logger.debug("Loading all organizations via arize_toolkit…")
+        self.logger.debug("Loading all organizations…")
         orgs = with_retry(
             lambda: self._toolkit.get_all_organizations(),
             "get_all_organizations",
@@ -287,7 +330,7 @@ class BulkSetupRunner:
             # Org only exists as a dry-run placeholder — no real ID to query
             self._spaces_loaded_for.add(org_id)
             return
-        self.logger.debug("Loading spaces for org '%s' via arize_toolkit…", org_name)
+        self.logger.debug("Loading spaces for org '%s'…", org_name)
         self._set_toolkit_org(org_id, org_name)
         spaces = with_retry(
             lambda: self._toolkit.get_all_spaces(),
@@ -299,7 +342,9 @@ class BulkSetupRunner:
             self.logger.debug("  space: %s (%s)", space["name"], space["id"])
         self._spaces_loaded_for.add(org_id)
 
-    def _resolve_space(self, org_id: str, org_name: str, space_name: str) -> tuple[str, str]:
+    def _resolve_space(
+        self, org_id: str, org_name: str, space_name: str
+    ) -> tuple[str, str]:
         """Return (space_id, status). Creates the space if it doesn't exist."""
         self._load_spaces_for_org(org_id, org_name)
 
@@ -307,7 +352,7 @@ class BulkSetupRunner:
         if cache_key in self._space_cache:
             return self._space_cache[cache_key], "already_exists"
 
-        self.logger.info("Creating space '%s' in org '%s' via arize_toolkit…", space_name, org_name)
+        self.logger.info("Creating space '%s' in org '%s'…", space_name, org_name)
         if self.dry_run:
             fake_id = f"__dry_run_space_{space_name}__"
             self._space_cache[cache_key] = fake_id
@@ -330,10 +375,16 @@ class BulkSetupRunner:
     # ── SAML helpers ──────────────────────────────────────────────────────────
 
     def _load_saml_idp(self) -> None:
-        """Load the account's SAMLIdP and its existing role mappings (once)."""
-        if self._saml_idp_id is not None:
+        """Check for an existing SAMLIdP and load its role mappings (once).
+
+        If no IdP exists, sets _saml_idp_needs_creation=True and returns
+        without raising — creation is deferred to _flush_saml_mappings() so
+        all pending mappings can be included in a single createSAMLIdP call
+        (the API requires at least one mapping when allowLoginWithDefaults=False).
+        """
+        if self._saml_idp_id is not None or self._saml_idp_needs_creation:
             return
-        self.logger.debug("Loading SAML IdP (raw GQL — not in arize_toolkit)…")
+        self.logger.debug("Loading SAML IdP…")
         result = with_retry(
             lambda: self._gql.execute(_GET_SAML_IDP, variable_values={}),
             "getSAMLIdP",
@@ -341,33 +392,99 @@ class BulkSetupRunner:
         )
         edges = result["account"]["samlIdPs"]["edges"]
         if not edges:
-            raise RuntimeError(
-                "No SAML IdP found for this account. "
-                "Configure SAML in the Arize UI before running this script."
+            self._validate_saml_creation_params()
+            self._saml_idp_needs_creation = True
+            self.logger.info(
+                "No SAMLIdP found — will create one with all collected mappings."
             )
+            return
         idp = edges[0]["node"]
         self._saml_idp_id = idp["id"]
         self._saml_existing_mappings = idp.get("roleMappings") or []
+        self._saml_existing_email_domains = [
+            d["domain"] for d in (idp.get("emailDomainsList") or [])
+        ]
         self.logger.debug(
             "Found SAMLIdP %s with %d existing role mapping(s)",
             self._saml_idp_id,
             len(self._saml_existing_mappings),
         )
 
+    def _validate_saml_creation_params(self) -> None:
+        """Raise early if the params needed to create a new IdP are missing."""
+        if not self._email_domains:
+            raise RuntimeError(
+                "No SAML IdP found for this account. "
+                "Provide --email-domains and either --saml-metadata-url or "
+                "--saml-metadata-xml to create one automatically, or configure "
+                "SAML in the Arize UI first."
+            )
+        if not self._saml_metadata_url and not self._saml_metadata_xml:
+            raise RuntimeError(
+                "No SAML IdP found and no metadata supplied. "
+                "Provide --saml-metadata-url or --saml-metadata-xml to create one."
+            )
+
+    def _create_saml_idp_with_mappings(self, mappings_input: list[dict]) -> None:
+        """Create a new SAMLIdP and include all pending mappings in one call."""
+        if self.dry_run:
+            self.logger.info(
+                "[DRY RUN] Would create SAMLIdP (metadata_url=%s, domains=%s) "
+                "with %d mapping(s)",
+                self._saml_metadata_url,
+                self._email_domains,
+                len(mappings_input),
+            )
+            self._saml_idp_id = "__dry_run_saml_idp__"
+            return
+
+        self.logger.info(
+            "Creating SAMLIdP (domains: %s) with %d mapping(s)…",
+            ", ".join(self._email_domains),
+            len(mappings_input),
+        )
+        idp_input: dict = {
+            "emailDomainsList": [{"domain": d} for d in self._email_domains],
+            "syncUserRoles": True,
+            "allowLoginWithDefaults": False,
+            "roleMappings": {"mappingsList": mappings_input},
+        }
+        if self._saml_metadata_url:
+            idp_input["metadataUrl"] = self._saml_metadata_url
+        if self._saml_metadata_xml:
+            idp_input["metadataXml"] = self._saml_metadata_xml
+
+        result = with_retry(
+            lambda: self._gql.execute(
+                _CREATE_SAML_IDP, variable_values={"input": idp_input}
+            ),
+            "createSAMLIdP",
+            self.logger,
+        )
+        payload = result.get("createSAMLIdP", {})
+        if payload.get("error"):
+            raise RuntimeError(f"createSAMLIdP returned error: {payload['error']}")
+        idp = payload["idp"]
+        self._saml_idp_id = idp["id"]
+        self._saml_existing_mappings = idp.get("roleMappings") or []
+        self.logger.info("SAMLIdP created: %s", self._saml_idp_id)
+
     def _mapping_exists(
         self, space_id: str, space_role: str, attr_name: str, attr_value: str
     ) -> bool:
-        """True if any existing or already-queued mapping covers this combo."""
+        """True if any existing or already-queued mapping covers this combo.
+
+        When the IdP doesn't exist yet (_saml_idp_needs_creation=True) there
+        are no existing mappings, so only the within-run dedup check applies.
+        """
         for mapping in self._saml_existing_mappings:
             attrs = mapping.get("attributesMap") or []
             spaces = mapping.get("spaceRolesMap") or []
             has_attr = any(
-                len(p) >= 2 and p[0] == attr_name and p[1] == attr_value
-                for p in attrs
+                len(p) >= 2 and p[0] == attr_name and p[1] == attr_value for p in attrs
             )
             has_space_role = any(
-                len(p) >= 2 and p[0] == space_id and p[1] == space_role
-                for p in spaces
+                len(p) >= 2 and p[0] == space_id and p[1] == space_role for p in spaces
             )
             if has_attr and has_space_role:
                 return True
@@ -380,15 +497,37 @@ class BulkSetupRunner:
             for p in self._saml_pending
         )
 
-    def _flush_saml_mappings(self) -> None:
-        """One updateSAMLIdP call that adds all pending new mappings.
+    def _build_new_mappings_input(self) -> list[dict]:
+        return [
+            {
+                "attributesMap": [[p.attr_name, p.attr_value]],
+                "spaceRolesMap": [[p.space_id, p.space_role]],
+                "orgRole": {"orgId": p.org_id, "roleId": "member"},
+                "isAccountAdmin": False,
+            }
+            for p in self._saml_pending
+        ]
 
-        updateSAMLIdP is a full-replace operation — we send existing mappings
-        (with their IDs preserved) plus the new ones.
+    def _flush_saml_mappings(self) -> None:
+        """Persist all pending mappings in a single API call.
+
+        - If the IdP already existed: updateSAMLIdP (full-replace, existing + new).
+        - If no IdP existed yet: createSAMLIdP with all mappings included
+          (the API requires at least one mapping when allowLoginWithDefaults=False).
         """
-        if not self._saml_pending or self._saml_idp_id is None:
+        if not self._saml_pending:
             return
 
+        new_mappings = self._build_new_mappings_input()
+
+        if self._saml_idp_needs_creation:
+            self._create_saml_idp_with_mappings(new_mappings)
+            return
+
+        if self._saml_idp_id is None:
+            return
+
+        # Re-serialize existing mappings preserving their IDs
         mappings_input = []
         for m in self._saml_existing_mappings:
             entry: dict = {
@@ -404,28 +543,26 @@ class BulkSetupRunner:
                     "roleId": m["orgRole"]["roleId"],
                 }
             mappings_input.append(entry)
-
-        for p in self._saml_pending:
-            mappings_input.append({
-                "attributesMap": [[p.attr_name, p.attr_value]],
-                "spaceRolesMap": [[p.space_id, p.space_role]],
-                "isAccountAdmin": False,
-            })
+        mappings_input.extend(new_mappings)
 
         self.logger.info(
             "Updating SAMLIdP (raw GQL): %d existing + %d new mapping(s)",
             len(self._saml_existing_mappings),
             len(self._saml_pending),
         )
+        # Re-include the existing email domains — updateSAMLIdP requires at least one
+        email_domains_for_update = (
+            self._email_domains or self._saml_existing_email_domains
+        )
+        update_input: dict = {
+            "id": self._saml_idp_id,
+            "roleMappings": {"mappingsList": mappings_input},
+            "emailDomainsList": [{"domain": d} for d in email_domains_for_update],
+        }
         result = with_retry(
             lambda: self._gql.execute(
                 _UPDATE_SAML_IDP,
-                variable_values={
-                    "input": {
-                        "id": self._saml_idp_id,
-                        "roleMappings": {"mappingsList": mappings_input},
-                    }
-                },
+                variable_values={"input": update_input},
             ),
             "updateSAMLIdP",
             self.logger,
@@ -481,7 +618,11 @@ class BulkSetupRunner:
             elif space_status == "already_exists":
                 self.spaces_existed += 1
             self.logger.debug(
-                "Row %d: space '%s' — %s (%s)", row_number, space_name, space_status, space_id
+                "Row %d: space '%s' — %s (%s)",
+                row_number,
+                space_name,
+                space_status,
+                space_id,
             )
 
             # 3. SAML mapping (raw GQL — arize_toolkit has no SAML support)
@@ -492,28 +633,42 @@ class BulkSetupRunner:
                 result.status = "already_exists"
                 self.logger.debug(
                     "Row %d: SAML mapping (%s=%s → %s/%s) already exists — skipping",
-                    row_number, attr_name, attr_value, space_name, arize_role,
+                    row_number,
+                    attr_name,
+                    attr_value,
+                    space_name,
+                    arize_role,
                 )
             else:
                 if self.dry_run:
                     self.logger.info(
-                        "[DRY RUN] Row %d: Would create SAML mapping "
-                        "(%s=%s → %s/%s)",
-                        row_number, attr_name, attr_value, space_name, arize_role,
+                        "[DRY RUN] Row %d: Would create SAML mapping (%s=%s → %s/%s)",
+                        row_number,
+                        attr_name,
+                        attr_value,
+                        space_name,
+                        arize_role,
                     )
                     result.status = "dry_run"
                 else:
-                    self._saml_pending.append(PendingSAMLMapping(
-                        row_number=row_number,
-                        space_id=space_id,
-                        space_role=space_role,
-                        attr_name=attr_name,
-                        attr_value=attr_value,
-                    ))
+                    self._saml_pending.append(
+                        PendingSAMLMapping(
+                            row_number=row_number,
+                            org_id=org_id,
+                            space_id=space_id,
+                            space_role=space_role,
+                            attr_name=attr_name,
+                            attr_value=attr_value,
+                        )
+                    )
                     result.status = "created"
                     self.logger.debug(
                         "Row %d: SAML mapping (%s=%s → %s/%s) queued",
-                        row_number, attr_name, attr_value, space_name, arize_role,
+                        row_number,
+                        attr_name,
+                        attr_value,
+                        space_name,
+                        arize_role,
                     )
 
         except Exception as exc:
@@ -528,7 +683,7 @@ class BulkSetupRunner:
     def run(self, rows: list[dict]) -> list[RowResult]:
         results: list[RowResult] = []
 
-        for i, row in enumerate(rows, start=2):  # row 1 = header
+        for i, row in enumerate(rows, start=1):
             results.append(self.process_row(row, i))
 
         # Flush all queued SAML mappings in a single updateSAMLIdP call
@@ -536,7 +691,9 @@ class BulkSetupRunner:
             try:
                 self._flush_saml_mappings()
                 self.mappings_created += len(self._saml_pending)
-                self.logger.info("%d new SAML mapping(s) created.", len(self._saml_pending))
+                self.logger.info(
+                    "%d new SAML mapping(s) created.", len(self._saml_pending)
+                )
             except Exception as exc:
                 self.logger.error("Failed to flush SAML mappings: %s", exc)
                 pending_rows = {p.row_number for p in self._saml_pending}
@@ -556,8 +713,11 @@ class BulkSetupRunner:
 # ─── CSV helpers ─────────────────────────────────────────────────────────────
 
 REQUIRED_COLUMNS = {
-    "organization", "space", "arize_role",
-    "saml_attribute_name", "saml_attribute_value",
+    "organization",
+    "space",
+    "arize_role",
+    "saml_attribute_name",
+    "saml_attribute_value",
 }
 
 
@@ -589,18 +749,21 @@ def write_results_csv(results: list[RowResult], output_path: str) -> None:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         for r in results:
-            writer.writerow({
-                "organization": r.organization,
-                "space": r.space,
-                "arize_role": r.arize_role,
-                "saml_attribute_name": r.saml_attribute_name,
-                "saml_attribute_value": r.saml_attribute_value,
-                "status": r.status,
-                "error_message": r.error_message,
-            })
+            writer.writerow(
+                {
+                    "organization": r.organization,
+                    "space": r.space,
+                    "arize_role": r.arize_role,
+                    "saml_attribute_name": r.saml_attribute_name,
+                    "saml_attribute_value": r.saml_attribute_value,
+                    "status": r.status,
+                    "error_message": r.error_message,
+                }
+            )
 
 
 # ─── Summary printer ─────────────────────────────────────────────────────────
+
 
 def print_summary(
     runner: BulkSetupRunner, results: list[RowResult], output_path: str
@@ -610,9 +773,15 @@ def print_summary(
     print("─" * 50)
     print("Summary")
     print("─" * 50)
-    print(f"  Organizations : {runner.orgs_created} created, {runner.orgs_existed} already existed")
-    print(f"  Spaces        : {runner.spaces_created} created, {runner.spaces_existed} already existed")
-    print(f"  SAML mappings : {runner.mappings_created} created, {runner.mappings_existed} already existed")
+    print(
+        f"  Organizations : {runner.orgs_created} created, {runner.orgs_existed} already existed"
+    )
+    print(
+        f"  Spaces        : {runner.spaces_created} created, {runner.spaces_existed} already existed"
+    )
+    print(
+        f"  SAML mappings : {runner.mappings_created} created, {runner.mappings_existed} already existed"
+    )
     if errors:
         print(f"  Errors        : {len(errors)} row(s) failed — review {output_path}")
     else:
@@ -624,6 +793,7 @@ def print_summary(
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="arize_saml_bulk_setup.py",
@@ -632,14 +802,20 @@ def build_parser() -> argparse.ArgumentParser:
             "role mappings from a CSV file."
         ),
     )
-    parser.add_argument("--csv", required=True, metavar="CSV", help="Path to input CSV file")
+    parser.add_argument(
+        "--csv", required=True, metavar="CSV", help="Path to input CSV file"
+    )
     parser.add_argument(
         "--api-key",
         metavar="API_KEY",
         help="Arize API key (or set ARIZE_API_KEY / ARIZE_DEVELOPER_KEY env var)",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Preview actions without API calls")
-    parser.add_argument("--verbose", action="store_true", help="Enable per-row debug logging")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Preview actions without API calls"
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable per-row debug logging"
+    )
     parser.add_argument(
         "--output",
         default="saml_setup_results.csv",
@@ -651,6 +827,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=ARIZE_APP_URL,
         metavar="URL",
         help=f"Arize app base URL (default: {ARIZE_APP_URL})",
+    )
+
+    saml_group = parser.add_argument_group(
+        "SAML IdP creation (only needed if no IdP is configured yet)"
+    )
+    saml_group.add_argument(
+        "--saml-metadata-url",
+        metavar="URL",
+        help="URL to fetch SAML IdP metadata from (mutually exclusive with --saml-metadata-xml)",
+    )
+    saml_group.add_argument(
+        "--saml-metadata-xml",
+        metavar="XML",
+        help="Raw SAML IdP metadata XML string (mutually exclusive with --saml-metadata-url)",
+    )
+    saml_group.add_argument(
+        "--email-domains",
+        metavar="DOMAINS",
+        help="Comma-separated email domains for the IdP (e.g. acme.com,subsidiary.com)",
     )
     return parser
 
@@ -674,17 +869,31 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.saml_metadata_url and args.saml_metadata_xml:
+        parser.error(
+            "--saml-metadata-url and --saml-metadata-xml are mutually exclusive."
+        )
+
     api_key = resolve_api_key(args.api_key)
     rows = load_csv(args.csv)
 
     if args.dry_run:
         print("DRY RUN — no changes will be made.\n")
 
+    email_domains = (
+        [d.strip() for d in args.email_domains.split(",") if d.strip()]
+        if args.email_domains
+        else None
+    )
+
     runner = BulkSetupRunner(
         api_key=api_key,
         dry_run=args.dry_run,
         verbose=args.verbose,
         arize_app_url=args.arize_url,
+        saml_metadata_url=args.saml_metadata_url,
+        saml_metadata_xml=args.saml_metadata_xml,
+        email_domains=email_domains,
     )
 
     results = runner.run(rows)
