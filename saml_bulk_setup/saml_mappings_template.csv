@@ -1,0 +1,6 @@
+organization,space,arize_role,saml_attribute_name,saml_attribute_value
+Acme Corp,ML Platform,admin,groups,arize-admins
+Acme Corp,ML Platform,member,groups,arize-ml-engineers
+Acme Corp,Fraud Detection,member,groups,arize-fraud-team
+Acme Corp,Fraud Detection,viewer,groups,arize-risk-analysts
+Subsidiary Inc,NLP Research,admin,groups,arize-nlp-leads
