@@ -22,12 +22,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional, TypeVar
 
-# arize_toolkit — used for all org/space operations it supports:
-#   get_all_organizations(), get_all_spaces(), create_new_space()
 from arize_toolkit import Client as ArizeClient
-
-# Raw GQL — only for operations not covered by arize_toolkit:
-#   createOrganization, getSAMLIdP, updateSAMLIdP
 from gql import gql
 
 # ─── Constants ───────────────────────────────────────────────────────────────
@@ -36,19 +31,26 @@ ARIZE_APP_URL = "https://app.arize.com"
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0  # seconds
 
-VALID_ROLES = {"admin", "member", "viewer"}
-
-# PRD uses "viewer"; Arize GraphQL schema uses "readOnly"
-ROLE_ALIAS: dict[str, str] = {
+# CSV accepts "viewer" as a human-friendly alias; Arize GraphQL uses "readOnly"
+_ROLE_ALIAS: dict[str, str] = {
     "admin": "admin",
     "member": "member",
     "viewer": "readOnly",
+    "annotator": "annotator",
 }
+
+VALID_ORG_ROLES: set[str] = set(
+    _ROLE_ALIAS.keys()
+)  # admin | member | viewer | annotator
+VALID_SPACE_ROLES: set[str] = set(
+    _ROLE_ALIAS.keys()
+)  # admin | member | viewer | annotator
 
 OUTPUT_COLUMNS = [
     "organization",
     "space",
-    "arize_role",
+    "arize_org_role",
+    "arize_space_role",
     "saml_attribute_name",
     "saml_attribute_value",
     "status",
@@ -57,7 +59,6 @@ OUTPUT_COLUMNS = [
 
 # ─── Raw GraphQL — only for operations not in arize_toolkit ──────────────────
 
-# arize_toolkit has no createOrganization method
 _CREATE_ORGANIZATION = gql("""
     mutation createOrganization($input: CreateOrganizationMutationInput!) {
         createOrganization(input: $input) {
@@ -69,7 +70,6 @@ _CREATE_ORGANIZATION = gql("""
     }
 """)
 
-# arize_toolkit has no SAML operations
 _CREATE_SAML_IDP = gql("""
     mutation createSAMLIdP($input: CreateSAMLIdPInput!) {
         createSAMLIdP(input: $input) {
@@ -143,7 +143,8 @@ class RowResult:
     row_number: int
     organization: str
     space: str
-    arize_role: str
+    arize_org_role: str
+    arize_space_role: str
     saml_attribute_name: str
     saml_attribute_value: str
     status: str = ""
@@ -157,7 +158,8 @@ class PendingSAMLMapping:
     row_number: int
     org_id: str
     space_id: str
-    space_role: str  # translated: "admin" | "member" | "readOnly"
+    org_role: str  # translated: "admin" | "member" | "readOnly" | "annotator"
+    space_role: str  # translated: "admin" | "member" | "readOnly" | "annotator"
     attr_name: str
     attr_value: str
 
@@ -178,7 +180,6 @@ def with_retry(
     logger: logging.Logger,
 ) -> T:
     """Call fn(), retrying with exponential backoff on rate-limit errors."""
-    last_exc: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
         try:
             return fn()
@@ -193,12 +194,8 @@ def with_retry(
                     wait,
                 )
                 time.sleep(wait)
-                last_exc = exc
             else:
                 raise
-    raise RuntimeError(
-        f"All {MAX_RETRIES} retries exhausted for '{operation_name}'"
-    ) from last_exc
 
 
 # ─── Main runner ─────────────────────────────────────────────────────────────
@@ -231,8 +228,7 @@ class BulkSetupRunner:
             arize_developer_key=api_key,
             arize_app_url=arize_app_url,
         )
-        # _graphql_client is the underlying gql.Client; used only for the three
-        # operations arize_toolkit does not cover (createOrganization, SAML).
+        # _graphql_client is the underlying gql.Client
         self._gql = self._toolkit._graphql_client
 
         # In-memory caches
@@ -262,6 +258,8 @@ class BulkSetupRunner:
         self.spaces_existed = 0
         self.mappings_created = 0
         self.mappings_existed = 0
+        self._counted_orgs: set[str] = set()
+        self._counted_spaces: set[str] = set()
 
     # ── Org context management ────────────────────────────────────────────────
 
@@ -299,7 +297,6 @@ class BulkSetupRunner:
             self._set_toolkit_org(org_id, org_name)
             return org_id, "already_exists"
 
-        # createOrganization is not in arize_toolkit — use raw GQL
         self.logger.info("Creating organization: %s", org_name)
         if self.dry_run:
             fake_id = f"__dry_run_org_{org_name}__"
@@ -470,7 +467,12 @@ class BulkSetupRunner:
         self.logger.info("SAMLIdP created: %s", self._saml_idp_id)
 
     def _mapping_exists(
-        self, space_id: str, space_role: str, attr_name: str, attr_value: str
+        self,
+        space_id: str,
+        org_role: str,
+        space_role: str,
+        attr_name: str,
+        attr_value: str,
     ) -> bool:
         """True if any existing or already-queued mapping covers this combo.
 
@@ -480,33 +482,46 @@ class BulkSetupRunner:
         for mapping in self._saml_existing_mappings:
             attrs = mapping.get("attributesMap") or []
             spaces = mapping.get("spaceRolesMap") or []
+            existing_org_role = (mapping.get("orgRole") or {}).get("roleId", "")
             has_attr = any(
                 len(p) >= 2 and p[0] == attr_name and p[1] == attr_value for p in attrs
             )
-            has_space_role = any(
+            if not has_attr or existing_org_role != org_role:
+                continue
+            # No space role — attr + org role is the full identity
+            if not space_role:
+                return True
+            # Space role specified — verify it's present in spaceRolesMap
+            if any(
                 len(p) >= 2 and p[0] == space_id and p[1] == space_role for p in spaces
-            )
-            if has_attr and has_space_role:
+            ):
                 return True
         # Also deduplicate within the current run
         return any(
-            p.space_id == space_id
-            and p.space_role == space_role
-            and p.attr_name == attr_name
+            p.attr_name == attr_name
             and p.attr_value == attr_value
+            and p.org_role == org_role
+            and (
+                not space_role
+                or (p.space_id == space_id and p.space_role == space_role)
+            )
             for p in self._saml_pending
         )
 
     def _build_new_mappings_input(self) -> list[dict]:
-        return [
-            {
+        entries = []
+        for p in self._saml_pending:
+            entry: dict = {
                 "attributesMap": [[p.attr_name, p.attr_value]],
-                "spaceRolesMap": [[p.space_id, p.space_role]],
-                "orgRole": {"orgId": p.org_id, "roleId": "member"},
+                "orgRole": {"orgId": p.org_id, "roleId": p.org_role},
                 "isAccountAdmin": False,
             }
-            for p in self._saml_pending
-        ]
+            # Include space role only when explicitly set — omitting it lets the
+            # backend inherit the space role from the org role.
+            if p.space_role:
+                entry["spaceRolesMap"] = [[p.space_id, p.space_role]]
+            entries.append(entry)
+        return entries
 
     def _flush_saml_mappings(self) -> None:
         """Persist all pending mappings in a single API call.
@@ -575,48 +590,96 @@ class BulkSetupRunner:
     # ── Row processor ─────────────────────────────────────────────────────────
 
     def process_row(self, row: dict, row_number: int) -> RowResult:
-        org_name = row["organization"].strip()
-        space_name = row["space"].strip()
-        arize_role = row["arize_role"].strip().lower()
-        attr_name = row["saml_attribute_name"].strip()
-        attr_value = row["saml_attribute_value"].strip()
+        org_name = (row.get("organization") or "").strip()
+        space_name = (row.get("space") or "").strip()
+        arize_org_role = (row.get("arize_org_role") or "").strip().lower()
+        arize_space_role = (row.get("arize_space_role") or "").strip().lower()
+        attr_name = (row.get("saml_attribute_name") or "").strip()
+        attr_value = (row.get("saml_attribute_value") or "").strip()
 
         result = RowResult(
             row_number=row_number,
             organization=org_name,
             space=space_name,
-            arize_role=arize_role,
+            arize_org_role=arize_org_role,
+            arize_space_role=arize_space_role,
             saml_attribute_name=attr_name,
             saml_attribute_value=attr_value,
         )
 
-        if arize_role not in VALID_ROLES:
+        # Validate required fields are non-empty
+        missing = [
+            col
+            for col, val in [
+                ("organization", org_name),
+                ("space", space_name),
+                ("arize_org_role", arize_org_role),
+                ("saml_attribute_name", attr_name),
+                ("saml_attribute_value", attr_value),
+            ]
+            if not val
+        ]
+        if missing:
+            result.status = "error"
+            result.error_message = f"Missing required field(s): {', '.join(missing)}"
+            return result
+
+        # ── Role validation ────────────────────────────────────────────────────
+        if arize_org_role not in VALID_ORG_ROLES:
             result.status = "error"
             result.error_message = (
-                f"Invalid arize_role '{arize_role}'. "
-                f"Must be one of: {', '.join(sorted(VALID_ROLES))}"
+                f"Invalid arize_org_role '{arize_org_role}'. "
+                f"Must be one of: {', '.join(sorted(VALID_ORG_ROLES))}"
             )
             return result
 
-        space_role = ROLE_ALIAS[arize_role]
+        if arize_org_role == "admin":
+            # Org admin gets full org access — a space role is not applicable
+            if arize_space_role:
+                result.status = "error"
+                result.error_message = (
+                    f"Invalid combination: arize_org_role='admin' cannot be paired "
+                    f"with arize_space_role='{arize_space_role}'. "
+                    "Org admins receive full org access; leave arize_space_role blank."
+                )
+                return result
+        else:
+            # Space role is optional for non-admin org roles — when omitted the
+            # backend inherits the space role from the org role.
+            # If a value IS provided it must be a recognised role name.
+            if arize_space_role and arize_space_role not in VALID_SPACE_ROLES:
+                result.status = "error"
+                result.error_message = (
+                    f"Invalid arize_space_role '{arize_space_role}'. "
+                    f"Must be one of: {', '.join(sorted(VALID_SPACE_ROLES))}, "
+                    "or leave blank to inherit from arize_org_role."
+                )
+                return result
+
+        org_role = _ROLE_ALIAS[arize_org_role]
+        space_role = _ROLE_ALIAS[arize_space_role] if arize_space_role else ""
 
         try:
             # 1. Resolve org (arize_toolkit: get_all_organizations / raw GQL: createOrganization)
             org_id, org_status = self._resolve_org(org_name)
-            if org_status == "created":
-                self.orgs_created += 1
-            elif org_status == "already_exists":
-                self.orgs_existed += 1
+            if org_id not in self._counted_orgs:
+                self._counted_orgs.add(org_id)
+                if org_status in ("created", "dry_run"):
+                    self.orgs_created += 1
+                elif org_status == "already_exists":
+                    self.orgs_existed += 1
             self.logger.debug(
                 "Row %d: org '%s' — %s (%s)", row_number, org_name, org_status, org_id
             )
 
             # 2. Resolve space (arize_toolkit: get_all_spaces / create_new_space)
             space_id, space_status = self._resolve_space(org_id, org_name, space_name)
-            if space_status == "created":
-                self.spaces_created += 1
-            elif space_status == "already_exists":
-                self.spaces_existed += 1
+            if space_id not in self._counted_spaces:
+                self._counted_spaces.add(space_id)
+                if space_status in ("created", "dry_run"):
+                    self.spaces_created += 1
+                elif space_status == "already_exists":
+                    self.spaces_existed += 1
             self.logger.debug(
                 "Row %d: space '%s' — %s (%s)",
                 row_number,
@@ -625,51 +688,57 @@ class BulkSetupRunner:
                 space_id,
             )
 
-            # 3. SAML mapping (raw GQL — arize_toolkit has no SAML support)
+            # 3. SAML mapping
             self._load_saml_idp()
 
-            if self._mapping_exists(space_id, space_role, attr_name, attr_value):
+            if self._mapping_exists(
+                space_id, org_role, space_role, attr_name, attr_value
+            ):
                 self.mappings_existed += 1
                 result.status = "already_exists"
                 self.logger.debug(
-                    "Row %d: SAML mapping (%s=%s → %s/%s) already exists — skipping",
+                    "Row %d: SAML mapping (%s=%s → %s, org:%s/space:%s) already exists — skipping",
                     row_number,
                     attr_name,
                     attr_value,
                     space_name,
-                    arize_role,
+                    arize_org_role,
+                    arize_space_role or "n/a",
                 )
             else:
                 if self.dry_run:
                     self.logger.info(
-                        "[DRY RUN] Row %d: Would create SAML mapping (%s=%s → %s/%s)",
+                        "[DRY RUN] Row %d: Would create SAML mapping (%s=%s → %s, org:%s/space:%s)",
                         row_number,
                         attr_name,
                         attr_value,
                         space_name,
-                        arize_role,
+                        arize_org_role,
+                        arize_space_role or "n/a",
                     )
                     result.status = "dry_run"
                 else:
-                    self._saml_pending.append(
-                        PendingSAMLMapping(
-                            row_number=row_number,
-                            org_id=org_id,
-                            space_id=space_id,
-                            space_role=space_role,
-                            attr_name=attr_name,
-                            attr_value=attr_value,
-                        )
-                    )
                     result.status = "created"
                     self.logger.debug(
-                        "Row %d: SAML mapping (%s=%s → %s/%s) queued",
+                        "Row %d: SAML mapping (%s=%s → %s, org:%s/space:%s) queued",
                         row_number,
                         attr_name,
                         attr_value,
                         space_name,
-                        arize_role,
+                        arize_org_role,
+                        arize_space_role or "n/a",
                     )
+                self._saml_pending.append(
+                    PendingSAMLMapping(
+                        row_number=row_number,
+                        org_id=org_id,
+                        space_id=space_id,
+                        org_role=org_role,
+                        space_role=space_role,
+                        attr_name=attr_name,
+                        attr_value=attr_value,
+                    )
+                )
 
         except Exception as exc:
             result.status = "error"
@@ -686,6 +755,9 @@ class BulkSetupRunner:
         for i, row in enumerate(rows, start=1):
             results.append(self.process_row(row, i))
 
+        if self.dry_run:
+            self.mappings_created = len(self._saml_pending)
+
         # Flush all queued SAML mappings in a single updateSAMLIdP call
         if self._saml_pending and not self.dry_run:
             try:
@@ -701,12 +773,6 @@ class BulkSetupRunner:
                     if r.row_number in pending_rows and r.status == "created":
                         r.status = "error"
                         r.error_message = f"SAML update failed: {exc}"
-        elif self.dry_run and self._saml_pending:
-            self.logger.info(
-                "[DRY RUN] Would create %d new SAML mapping(s).",
-                len(self._saml_pending),
-            )
-
         return results
 
 
@@ -715,7 +781,8 @@ class BulkSetupRunner:
 REQUIRED_COLUMNS = {
     "organization",
     "space",
-    "arize_role",
+    "arize_org_role",
+    "arize_space_role",
     "saml_attribute_name",
     "saml_attribute_value",
 }
@@ -737,7 +804,7 @@ def load_csv(path: str) -> list[dict]:
                 file=sys.stderr,
             )
             sys.exit(1)
-        rows = [row for row in reader if any(v.strip() for v in row.values())]
+        rows = [row for row in reader if any(v and v.strip() for v in row.values())]
     if not rows:
         print("ERROR: CSV file has no data rows.", file=sys.stderr)
         sys.exit(1)
@@ -753,7 +820,8 @@ def write_results_csv(results: list[RowResult], output_path: str) -> None:
                 {
                     "organization": r.organization,
                     "space": r.space,
-                    "arize_role": r.arize_role,
+                    "arize_org_role": r.arize_org_role,
+                    "arize_space_role": r.arize_space_role,
                     "saml_attribute_name": r.saml_attribute_name,
                     "saml_attribute_value": r.saml_attribute_value,
                     "status": r.status,
