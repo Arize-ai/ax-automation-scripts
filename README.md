@@ -17,7 +17,7 @@ Scripts in this repository are designed to be:
 ## Repository Structure
 
 ```
-arize-automation-scripts/
+ax-automation-scripts/
 ├── README.md
 ├── LICENSE
 └── scripts/
