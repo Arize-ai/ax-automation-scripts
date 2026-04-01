@@ -101,6 +101,9 @@ _GET_SAML_IDP = gql("""
                         emailDomainsList {
                             domain
                         }
+                        enforceSaml
+                        syncUserRoles
+                        signAuthn
                         roleMappings {
                             id
                             attributesMap
@@ -111,6 +114,7 @@ _GET_SAML_IDP = gql("""
                                 roleId
                             }
                         }
+                        allowLoginWithDefaults
                     }
                 }
             }
@@ -163,6 +167,15 @@ class PendingSAMLMapping:
     attr_name: str
     attr_value: str
 
+@dataclass
+class SamlFlags:
+    """SAML config flags used for create defaults and update preservation."""
+
+    enforce_saml: bool
+    sync_user_roles: bool
+    sign_authn: bool
+    allow_login_with_defaults: bool
+
 
 # ─── Retry helper ────────────────────────────────────────────────────────────
 
@@ -211,6 +224,9 @@ class BulkSetupRunner:
         saml_metadata_url: Optional[str] = None,
         saml_metadata_xml: Optional[str] = None,
         email_domains: Optional[list[str]] = None,
+        enforce_saml: Optional[bool] = None,
+        sync_user_roles: Optional[bool] = None,
+        sign_authn: Optional[bool] = None,
     ) -> None:
         self.dry_run = dry_run
 
@@ -250,6 +266,15 @@ class BulkSetupRunner:
         self._saml_existing_mappings: list[dict] = []
         self._saml_existing_email_domains: list[str] = []  # re-sent on updateSAMLIdP
         self._saml_pending: list[PendingSAMLMapping] = []
+        self._enforce_saml_override = enforce_saml is True
+        self._sync_user_roles_override = sync_user_roles is True
+        self._sign_authn_override = sign_authn is True
+        self._saml_flags = SamlFlags(
+            enforce_saml=bool(enforce_saml),
+            sync_user_roles=True if sync_user_roles is None else sync_user_roles,
+            sign_authn=bool(sign_authn),
+            allow_login_with_defaults=False,
+        )
 
         # Run counters
         self.orgs_created = 0
@@ -401,6 +426,18 @@ class BulkSetupRunner:
         self._saml_existing_email_domains = [
             d["domain"] for d in (idp.get("emailDomainsList") or [])
         ]
+        self._saml_flags = SamlFlags(
+            enforce_saml=idp.get("enforceSaml") or False,
+            sync_user_roles=idp.get("syncUserRoles") or False,
+            sign_authn=idp.get("signAuthn") or False,
+            allow_login_with_defaults=idp.get("allowLoginWithDefaults") or False,
+        )
+        if self._enforce_saml_override:
+            self._saml_flags.enforce_saml = True
+        if self._sync_user_roles_override:
+            self._saml_flags.sync_user_roles = True
+        if self._sign_authn_override:
+            self._saml_flags.sign_authn = True
         self.logger.debug(
             "Found SAMLIdP %s with %d existing role mapping(s)",
             self._saml_idp_id,
@@ -442,8 +479,10 @@ class BulkSetupRunner:
         )
         idp_input: dict = {
             "emailDomainsList": [{"domain": d} for d in self._email_domains],
-            "syncUserRoles": True,
-            "allowLoginWithDefaults": False,
+            "enforceSaml": self._saml_flags.enforce_saml,
+            "syncUserRoles": self._saml_flags.sync_user_roles,
+            "signAuthn": self._saml_flags.sign_authn,
+            "allowLoginWithDefaults": self._saml_flags.allow_login_with_defaults,
             "roleMappings": {"mappingsList": mappings_input},
         }
         if self._saml_metadata_url:
@@ -574,6 +613,13 @@ class BulkSetupRunner:
             "roleMappings": {"mappingsList": mappings_input},
             "emailDomainsList": [{"domain": d} for d in email_domains_for_update],
         }
+        if self._saml_flags:
+            update_input.update({
+                "enforceSaml": self._saml_flags.enforce_saml,
+                "syncUserRoles": self._saml_flags.sync_user_roles,
+                "signAuthn": self._saml_flags.sign_authn,
+                "allowLoginWithDefaults": self._saml_flags.allow_login_with_defaults,
+            })
         result = with_retry(
             lambda: self._gql.execute(
                 _UPDATE_SAML_IDP,
@@ -915,6 +961,24 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DOMAINS",
         help="Comma-separated email domains for the IdP (e.g. acme.com,subsidiary.com)",
     )
+    saml_group.add_argument(
+        "--enforce-saml",
+        action="store_true",
+        default=None,
+        help="Enable SAML enforcement on create, or turn it on for an existing IdP update",
+    )
+    saml_group.add_argument(
+        "--sync-user-roles",
+        action="store_true",
+        default=None,
+        help="Enable sync user roles on create, or turn it on for an existing IdP update",
+    )
+    saml_group.add_argument(
+        "--sign-authn",
+        action="store_true",
+        default=None,
+        help="Enable signed authn requests on create, or turn it on for an existing IdP update",
+    )
     return parser
 
 
@@ -962,6 +1026,9 @@ def main() -> None:
         saml_metadata_url=args.saml_metadata_url,
         saml_metadata_xml=args.saml_metadata_xml,
         email_domains=email_domains,
+        enforce_saml=args.enforce_saml,
+        sync_user_roles=args.sync_user_roles,
+        sign_authn=args.sign_authn,
     )
 
     results = runner.run(rows)
