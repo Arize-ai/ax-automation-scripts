@@ -22,12 +22,14 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional, TypeVar
 
+import requests
 from arize_toolkit import Client as ArizeClient
 from gql import gql
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 ARIZE_APP_URL = "https://app.arize.com"
+ARIZE_REST_API_URL = "https://api.arize.com"
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0  # seconds
 
@@ -42,9 +44,9 @@ _ROLE_ALIAS: dict[str, str] = {
 VALID_ORG_ROLES: set[str] = set(
     _ROLE_ALIAS.keys()
 )  # admin | member | viewer | annotator
-VALID_SPACE_ROLES: set[str] = set(
-    _ROLE_ALIAS.keys()
-)  # admin | member | viewer | annotator
+# Space role: any _ROLE_ALIAS key uses the legacy spaceRolesMap; any other value
+# is treated as a custom RBAC role name (resolved against account.roles) and
+# applied via spaceRbacRolesMap.
 
 OUTPUT_COLUMNS = [
     "organization",
@@ -79,6 +81,7 @@ _CREATE_SAML_IDP = gql("""
                     id
                     attributesMap
                     spaceRolesMap
+                    spaceRbacRolesMap
                     isAccountAdmin
                     orgRole {
                         orgId
@@ -108,6 +111,7 @@ _GET_SAML_IDP = gql("""
                             id
                             attributesMap
                             spaceRolesMap
+                            spaceRbacRolesMap
                             isAccountAdmin
                             orgRole {
                                 orgId
@@ -131,13 +135,13 @@ _UPDATE_SAML_IDP = gql("""
                     id
                     attributesMap
                     spaceRolesMap
+                    spaceRbacRolesMap
                 }
             }
             error
         }
     }
 """)
-
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
 
@@ -163,7 +167,10 @@ class PendingSAMLMapping:
     org_id: str
     space_id: str
     org_role: str  # translated: "admin" | "member" | "readOnly" | "annotator"
-    space_role: str  # translated: "admin" | "member" | "readOnly" | "annotator"
+    # Exactly one of space_role / space_rbac_role_id is set (or both empty, meaning
+    # inherit the space role from the org role).
+    space_role: str  # legacy builtin: "admin" | "member" | "readOnly" | "annotator"
+    space_rbac_role_id: str  # custom RBAC role relay global ID (e.g. "Um9sZTo...")
     attr_name: str
     attr_value: str
 
@@ -237,6 +244,9 @@ class BulkSetupRunner:
         self.logger.setLevel(logging.DEBUG if verbose else logging.INFO)
         self.logger.propagate = False
 
+        # Retained for the REST role-lookup call (Authorization: Bearer header).
+        self._api_key = api_key
+
         # arize_toolkit.Client handles auth and exposes get_all_organizations(),
         # get_all_spaces(), and create_new_space(). We initialise with no
         # org/space so it auto-resolves the first available one.
@@ -266,6 +276,12 @@ class BulkSetupRunner:
         self._saml_existing_mappings: list[dict] = []
         self._saml_existing_email_domains: list[str] = []  # re-sent on updateSAMLIdP
         self._saml_pending: list[PendingSAMLMapping] = []
+
+        # Account-roles cache — loaded once on first reference to a non-builtin role
+        # name. Maps lowercase role name → relay global ID (e.g. "Um9sZTo...").
+        self._role_name_to_id: dict[str, str] = {}
+        self._role_ids: set[str] = set()
+        self._roles_loaded: bool = False
         self._enforce_saml_override = enforce_saml is True
         self._sync_user_roles_override = sync_user_roles is True
         self._sign_authn_override = sign_authn is True
@@ -285,6 +301,17 @@ class BulkSetupRunner:
         self.mappings_existed = 0
         self._counted_orgs: set[str] = set()
         self._counted_spaces: set[str] = set()
+
+        # Rows whose (attr, org_role, space, role) matched an existing IdP
+        # mapping exactly (status=already_exists, NOT in _saml_pending). Tracked
+        # so the preflight can spot CSV-internal contradictions where one row
+        # wants to keep an existing legacy entry while another row wants the
+        # same space migrated to custom (or vice versa).
+        #
+        # Each entry: (row_number, space_id, space_role, space_rbac_role_id).
+        # Exactly one of space_role / space_rbac_role_id is non-empty (matching
+        # whichever map the existing entry lived in).
+        self._exact_match_uses: list[tuple[int, str, str, str]] = []
 
     # ── Org context management ────────────────────────────────────────────────
 
@@ -393,6 +420,69 @@ class BulkSetupRunner:
         )
         self._space_cache[cache_key] = new_space_id
         return new_space_id, "created"
+
+    # ── Custom-role helpers ───────────────────────────────────────────────────
+
+    def _load_account_roles(self) -> None:
+        """Fetch all roles in the account once via REST; build a name → relay-ID cache.
+
+        Uses the REST endpoint `GET /v2/roles` which returns both predefined
+        and custom roles for the authenticated account. Paginates until
+        `pagination.has_more` is false. The cache is only consulted when the
+        CSV value didn't match a builtin alias upstream.
+        """
+        if self._roles_loaded:
+            return
+        self.logger.debug("Loading account roles for custom-role lookup…")
+        url = f"{ARIZE_REST_API_URL}/v2/roles"
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        cursor: Optional[str] = None
+        while True:
+            params: dict = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            resp = with_retry(
+                lambda: requests.get(url, headers=headers, params=params, timeout=30),
+                "GET /v2/roles",
+                self.logger,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            for role in payload.get("roles") or []:
+                rid = role.get("id") or ""
+                name = role.get("name") or ""
+                if not rid or not name:
+                    continue
+                self._role_name_to_id[name.lower()] = rid
+                self._role_ids.add(rid)
+            pagination = payload.get("pagination") or {}
+            if not pagination.get("has_more"):
+                break
+            cursor = pagination.get("next_cursor")
+            if not cursor:
+                # Defensive: has_more=true but no cursor returned — avoid infinite loop.
+                break
+        self._roles_loaded = True
+        self.logger.debug("  loaded %d account role(s)", len(self._role_name_to_id))
+
+    def _resolve_custom_space_role(self, role_value: str) -> str:
+        """Resolve a non-builtin space role to a relay role ID.
+
+        Accepts either a role name (looked up case-insensitively) or a relay
+        global ID (validated against the cache).
+        """
+        self._load_account_roles()
+        # Relay role IDs are base64 of "Role:<int>" → all start with "Um9sZTo".
+        if role_value.startswith("Um9sZTo") and role_value in self._role_ids:
+            return role_value
+        rid = self._role_name_to_id.get(role_value.lower())
+        if rid:
+            return rid
+        available = ", ".join(sorted(self._role_name_to_id.keys())) or "(none)"
+        raise ValueError(
+            f"Custom role '{role_value}' not found in this account. "
+            f"Available roles (case-insensitive): {available}"
+        )
 
     # ── SAML helpers ──────────────────────────────────────────────────────────
 
@@ -510,29 +600,41 @@ class BulkSetupRunner:
         space_id: str,
         org_role: str,
         space_role: str,
+        space_rbac_role_id: str,
         attr_name: str,
         attr_value: str,
     ) -> bool:
         """True if any existing or already-queued mapping covers this combo.
+
+        Handles all three space-role shapes:
+          - inherited (both space_role and space_rbac_role_id empty)
+          - legacy builtin (space_role set)
+          - custom RBAC (space_rbac_role_id set)
 
         When the IdP doesn't exist yet (_saml_idp_needs_creation=True) there
         are no existing mappings, so only the within-run dedup check applies.
         """
         for mapping in self._saml_existing_mappings:
             attrs = mapping.get("attributesMap") or []
-            spaces = mapping.get("spaceRolesMap") or []
+            legacy_spaces = mapping.get("spaceRolesMap") or []
+            rbac_spaces = mapping.get("spaceRbacRolesMap") or []
             existing_org_role = (mapping.get("orgRole") or {}).get("roleId", "")
             has_attr = any(
                 len(p) >= 2 and p[0] == attr_name and p[1] == attr_value for p in attrs
             )
             if not has_attr or existing_org_role != org_role:
                 continue
-            # No space role — attr + org role is the full identity
-            if not space_role:
+            # Inherited — attr + org role is the full identity
+            if not space_role and not space_rbac_role_id:
                 return True
-            # Space role specified — verify it's present in spaceRolesMap
-            if any(
-                len(p) >= 2 and p[0] == space_id and p[1] == space_role for p in spaces
+            if space_rbac_role_id and any(
+                len(p) >= 2 and p[0] == space_id and p[1] == space_rbac_role_id
+                for p in rbac_spaces
+            ):
+                return True
+            if space_role and any(
+                len(p) >= 2 and p[0] == space_id and p[1] == space_role
+                for p in legacy_spaces
             ):
                 return True
         # Also deduplicate within the current run
@@ -541,8 +643,17 @@ class BulkSetupRunner:
             and p.attr_value == attr_value
             and p.org_role == org_role
             and (
-                not space_role
-                or (p.space_id == space_id and p.space_role == space_role)
+                (not space_role and not space_rbac_role_id)
+                or (
+                    space_rbac_role_id
+                    and p.space_id == space_id
+                    and p.space_rbac_role_id == space_rbac_role_id
+                )
+                or (
+                    space_role
+                    and p.space_id == space_id
+                    and p.space_role == space_role
+                )
             )
             for p in self._saml_pending
         )
@@ -555,9 +666,11 @@ class BulkSetupRunner:
                 "orgRole": {"orgId": p.org_id, "roleId": p.org_role},
                 "isAccountAdmin": False,
             }
-            # Include space role only when explicitly set — omitting it lets the
-            # backend inherit the space role from the org role.
-            if p.space_role:
+            # Exactly one of the two space-role fields is sent (or neither, in
+            # which case the backend inherits the space role from the org role).
+            if p.space_rbac_role_id:
+                entry["spaceRbacRolesMap"] = [[p.space_id, p.space_rbac_role_id]]
+            elif p.space_role:
                 entry["spaceRolesMap"] = [[p.space_id, p.space_role]]
             entries.append(entry)
         return entries
@@ -581,12 +694,16 @@ class BulkSetupRunner:
         if self._saml_idp_id is None:
             return
 
-        # Re-serialize existing mappings preserving their IDs
+        # Re-serialize existing mappings preserving their IDs.
+        # spaceRbacRolesMap must be passed through alongside spaceRolesMap; an
+        # updateSAMLIdP that omitted it would drop any existing custom-role
+        # mappings on the IdP.
         mappings_input = []
         for m in self._saml_existing_mappings:
             entry: dict = {
                 "attributesMap": m.get("attributesMap") or [],
                 "spaceRolesMap": m.get("spaceRolesMap") or [],
+                "spaceRbacRolesMap": m.get("spaceRbacRolesMap") or [],
                 "isAccountAdmin": m.get("isAccountAdmin") or False,
             }
             if m.get("id"):
@@ -633,13 +750,169 @@ class BulkSetupRunner:
                 f"updateSAMLIdP returned error: {result['updateSAMLIdP']['error']}"
             )
 
+    # ── Preflight: same-space mixed-role-type conflict ────────────────────────
+
+    def _collect_space_role_uses(
+        self,
+    ) -> tuple[
+        dict[str, list[tuple[Optional[int], str]]],
+        dict[str, list[tuple[Optional[int], str]]],
+    ]:
+        """Return (legacy_uses, rbac_uses) — for every space_id, who's using it
+        in which role-type. Entry tuple is (csv_row_number_or_None, label).
+        row_number is None for an existing IdP mapping; integer for a CSV row.
+        """
+        legacy_uses: dict[str, list[tuple[Optional[int], str]]] = {}
+        rbac_uses: dict[str, list[tuple[Optional[int], str]]] = {}
+
+        for mapping in self._saml_existing_mappings:
+            for pair in mapping.get("spaceRolesMap") or []:
+                if len(pair) >= 2 and pair[0]:
+                    legacy_uses.setdefault(pair[0], []).append((None, "standard"))
+            for pair in mapping.get("spaceRbacRolesMap") or []:
+                if len(pair) >= 2 and pair[0]:
+                    rbac_uses.setdefault(pair[0], []).append((None, "custom"))
+
+        for p in self._saml_pending:
+            if p.space_rbac_role_id:
+                rbac_uses.setdefault(p.space_id, []).append((p.row_number, "custom"))
+            elif p.space_role:
+                legacy_uses.setdefault(p.space_id, []).append(
+                    (p.row_number, "standard")
+                )
+
+        # Exact-match (already_exists) rows also express the CSV's intent for a
+        # space's role-type. Include them so the preflight can detect a CSV that
+        # asks to keep an existing entry on one row while migrating it on another.
+        for row_number, space_id, space_role, space_rbac_role_id in self._exact_match_uses:
+            if space_rbac_role_id:
+                rbac_uses.setdefault(space_id, []).append((row_number, "custom"))
+            elif space_role:
+                legacy_uses.setdefault(space_id, []).append((row_number, "standard"))
+
+        return legacy_uses, rbac_uses
+
+    def _strip_space_from_existing_mappings(self, space_id: str, key: str) -> None:
+        """Remove a space's entries from existing IdP mappings under `key`
+        (either 'spaceRolesMap' or 'spaceRbacRolesMap').
+
+        Used to upsert the space's role-type when the CSV asks for one type
+        and the IdP already has the other for that space. Other entries on
+        the same mapping (other spaces, attributesMap, orgRole) stay intact.
+        We never remove the mapping itself — a mapping with no space roles
+        may still grant org-level access via orgRole.
+        """
+        for mapping in self._saml_existing_mappings:
+            entries = mapping.get(key)
+            if not entries:
+                continue
+            mapping[key] = [
+                pair
+                for pair in entries
+                if not (len(pair) >= 2 and pair[0] == space_id)
+            ]
+
+    def _preflight_role_type_conflicts(self, results: list[RowResult]) -> None:
+        """Resolve same-space mixed-role-type conflicts before the flush.
+
+        Arize only allows one role type (standard OR custom) per space across
+        all SAML role mappings. Two distinct conflict shapes need different
+        handling:
+
+        - **CSV-internal**: same space appears with both role types in the CSV
+          itself → user mistake → mark all contributing rows as `error` and
+          drop them from the pending list.
+        - **CSV-vs-existing**: the CSV asks for one role-type for a space the
+          IdP already has the other type for → migration intent → strip just
+          that space's existing entries (in place on `_saml_existing_mappings`)
+          and let the new CSV rows replace them. Other entries on the affected
+          mappings (other spaces, attributes, orgRole) are preserved.
+        """
+        legacy_uses, rbac_uses = self._collect_space_role_uses()
+        conflict_space_ids = set(legacy_uses) & set(rbac_uses)
+        if not conflict_space_ids:
+            return
+
+        # space_id → space_name from the existing space cache: (org_id, name) → id.
+        space_id_to_name = {sid: name for (_, name), sid in self._space_cache.items()}
+        # CSV row number → the original arize_space_role value the user wrote,
+        # so error messages reference the user's own input, not internal IDs.
+        row_to_user_role = {r.row_number: r.arize_space_role for r in results}
+
+        row_errors: dict[int, str] = {}
+        for space_id in conflict_space_ids:
+            space_name = space_id_to_name.get(space_id, "<unknown>")
+            pending_legacy_rows = sorted(
+                {row for row, _ in legacy_uses[space_id] if row is not None}
+            )
+            pending_rbac_rows = sorted(
+                {row for row, _ in rbac_uses[space_id] if row is not None}
+            )
+            has_existing_legacy = any(
+                row is None for row, _ in legacy_uses[space_id]
+            )
+            has_existing_rbac = any(row is None for row, _ in rbac_uses[space_id])
+
+            # Case 1: CSV-internal conflict — user mistake, error these rows.
+            if pending_legacy_rows and pending_rbac_rows:
+                def describe(rows: list[int]) -> str:
+                    return ", ".join(
+                        f"row {r} ('{row_to_user_role.get(r, '')}')" for r in rows
+                    )
+
+                message = (
+                    f"Space '{space_name}' would receive both a standard role and "
+                    f"a custom role from your CSV, which Arize does not allow. "
+                    f"Each space must use only one role type. Conflicts: "
+                    f"standard role in {describe(pending_legacy_rows)}; "
+                    f"custom role in {describe(pending_rbac_rows)}. "
+                    f"Please edit the CSV so this space uses either standard roles "
+                    f"(admin/member/viewer/annotator) or a custom role — not both."
+                )
+                for row in pending_legacy_rows + pending_rbac_rows:
+                    row_errors[row] = message
+                continue
+
+            # Case 2: CSV-vs-existing conflict — migration. Strip in place.
+            if pending_legacy_rows and has_existing_rbac:
+                self._strip_space_from_existing_mappings(
+                    space_id, key="spaceRbacRolesMap"
+                )
+            elif pending_rbac_rows and has_existing_legacy:
+                self._strip_space_from_existing_mappings(
+                    space_id, key="spaceRolesMap"
+                )
+            # Else: only existing entries collide (no pending touches this space).
+            # Not the script's job to fix pre-existing IdP state.
+
+        if not row_errors:
+            return
+
+        for r in results:
+            if r.row_number in row_errors:
+                # If the row had previously been marked already_exists by
+                # process_row, the counter was bumped optimistically; back it
+                # out so the summary reflects the final error status.
+                if r.status == "already_exists":
+                    self.mappings_existed -= 1
+                r.status = "error"
+                r.error_message = row_errors[r.row_number]
+                self.logger.error("Row %d: %s", r.row_number, r.error_message)
+
+        # Drop offending pending mappings so the flush proceeds with the rest.
+        self._saml_pending = [
+            p for p in self._saml_pending if p.row_number not in row_errors
+        ]
+
     # ── Row processor ─────────────────────────────────────────────────────────
 
     def process_row(self, row: dict, row_number: int) -> RowResult:
         org_name = (row.get("organization") or "").strip()
         space_name = (row.get("space") or "").strip()
         arize_org_role = (row.get("arize_org_role") or "").strip().lower()
-        arize_space_role = (row.get("arize_space_role") or "").strip().lower()
+        # Preserve the raw value (case + whitespace stripped) for custom-role lookup
+        # and error messages. The builtin-alias check below lowercases as needed.
+        arize_space_role_raw = (row.get("arize_space_role") or "").strip()
         attr_name = (row.get("saml_attribute_name") or "").strip()
         attr_value = (row.get("saml_attribute_value") or "").strip()
 
@@ -648,7 +921,7 @@ class BulkSetupRunner:
             organization=org_name,
             space=space_name,
             arize_org_role=arize_org_role,
-            arize_space_role=arize_space_role,
+            arize_space_role=arize_space_role_raw,
             saml_attribute_name=attr_name,
             saml_attribute_value=attr_value,
         )
@@ -681,29 +954,30 @@ class BulkSetupRunner:
 
         if arize_org_role == "admin":
             # Org admin gets full org access — a space role is not applicable
-            if arize_space_role:
+            if arize_space_role_raw:
                 result.status = "error"
                 result.error_message = (
                     f"Invalid combination: arize_org_role='admin' cannot be paired "
-                    f"with arize_space_role='{arize_space_role}'. "
+                    f"with arize_space_role='{arize_space_role_raw}'. "
                     "Org admins receive full org access; leave arize_space_role blank."
-                )
-                return result
-        else:
-            # Space role is optional for non-admin org roles — when omitted the
-            # backend inherits the space role from the org role.
-            # If a value IS provided it must be a recognised role name.
-            if arize_space_role and arize_space_role not in VALID_SPACE_ROLES:
-                result.status = "error"
-                result.error_message = (
-                    f"Invalid arize_space_role '{arize_space_role}'. "
-                    f"Must be one of: {', '.join(sorted(VALID_SPACE_ROLES))}, "
-                    "or leave blank to inherit from arize_org_role."
                 )
                 return result
 
         org_role = _ROLE_ALIAS[arize_org_role]
-        space_role = _ROLE_ALIAS[arize_space_role] if arize_space_role else ""
+        # Classify the space role:
+        #   "" / None     → inherit from org role (leave both fields empty)
+        #   builtin alias → use legacy spaceRolesMap with translated role string
+        #   anything else → custom RBAC role; resolve to relay ID and use spaceRbacRolesMap
+        # Custom-role resolution is deferred to the try-block below so lookup
+        # errors flow through the same error-handling path as org/space resolution.
+        space_role_lower = arize_space_role_raw.lower()
+        space_role = ""  # legacy builtin string (e.g. "readOnly"); set below if applicable
+        is_custom_space_role = False
+        if arize_space_role_raw:
+            if space_role_lower in _ROLE_ALIAS:
+                space_role = _ROLE_ALIAS[space_role_lower]
+            else:
+                is_custom_space_role = True
 
         try:
             # 1. Resolve org (arize_toolkit: get_all_organizations / raw GQL: createOrganization)
@@ -737,11 +1011,31 @@ class BulkSetupRunner:
             # 3. SAML mapping
             self._load_saml_idp()
 
+            # Resolve a custom RBAC role (if any) to its relay global ID.
+            space_rbac_role_id = (
+                self._resolve_custom_space_role(arize_space_role_raw)
+                if is_custom_space_role
+                else ""
+            )
+
+            display_space_role = arize_space_role_raw or "n/a"
             if self._mapping_exists(
-                space_id, org_role, space_role, attr_name, attr_value
+                space_id,
+                org_role,
+                space_role,
+                space_rbac_role_id,
+                attr_name,
+                attr_value,
             ):
                 self.mappings_existed += 1
                 result.status = "already_exists"
+                # Record the row's space + role-type so the preflight can spot
+                # CSV-internal contradictions (e.g. another row wants the same
+                # space migrated to the other role-type) before any silent strip.
+                if space_role or space_rbac_role_id:
+                    self._exact_match_uses.append(
+                        (row_number, space_id, space_role, space_rbac_role_id)
+                    )
                 self.logger.debug(
                     "Row %d: SAML mapping (%s=%s → %s, org:%s/space:%s) already exists — skipping",
                     row_number,
@@ -749,7 +1043,7 @@ class BulkSetupRunner:
                     attr_value,
                     space_name,
                     arize_org_role,
-                    arize_space_role or "n/a",
+                    display_space_role,
                 )
             else:
                 if self.dry_run:
@@ -760,7 +1054,7 @@ class BulkSetupRunner:
                         attr_value,
                         space_name,
                         arize_org_role,
-                        arize_space_role or "n/a",
+                        display_space_role,
                     )
                     result.status = "dry_run"
                 else:
@@ -772,7 +1066,7 @@ class BulkSetupRunner:
                         attr_value,
                         space_name,
                         arize_org_role,
-                        arize_space_role or "n/a",
+                        display_space_role,
                     )
                 self._saml_pending.append(
                     PendingSAMLMapping(
@@ -781,6 +1075,7 @@ class BulkSetupRunner:
                         space_id=space_id,
                         org_role=org_role,
                         space_role=space_role,
+                        space_rbac_role_id=space_rbac_role_id,
                         attr_name=attr_name,
                         attr_value=attr_value,
                     )
@@ -800,6 +1095,11 @@ class BulkSetupRunner:
 
         for i, row in enumerate(rows, start=1):
             results.append(self.process_row(row, i))
+
+        # Client-side check that mirrors the backend rule: a space can use either
+        # standard or custom roles across mappings, but not both. Drops offending
+        # pending rows so the flush succeeds for the rest of the batch.
+        self._preflight_role_type_conflicts(results)
 
         if self.dry_run:
             self.mappings_created = len(self._saml_pending)
