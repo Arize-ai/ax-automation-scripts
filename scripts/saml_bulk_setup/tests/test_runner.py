@@ -142,6 +142,83 @@ def test_dry_run_counters_split_created_vs_existed(
 # ── 8.3: --verbose toggles DEBUG ─────────────────────────────────────────────
 
 
+def test_dry_run_warns_when_custom_role_missing(
+    mock_arize_client,
+    rest_responses: RestResponses,
+    sample_row,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Dry-run: a CSV row referencing a nonexistent custom RBAC role surfaces a
+    WARNING + note, doesn't error, and doesn't queue a SAML mapping."""
+    rest_responses.stub_list(
+        "/v2/organizations",
+        "organizations",
+        [{"id": "Org_acme", "name": "Acme Corp"}],
+    )
+    rest_responses.stub_list(
+        "/v2/spaces",
+        "spaces",
+        [{"id": "Space_ml", "name": "ML Platform"}],
+    )
+    # Account has one custom role, but the CSV asks for a different one.
+    rest_responses.stub_list(
+        "/v2/roles",
+        "roles",
+        [{"id": "Um9sZTox", "name": "Project Reviewer"}],
+    )
+    runner = _build_runner(mock_arize_client, dry_run=True)
+    _stage(runner, {"getSAMLIdP": _empty_idp_with_no_mappings()})
+
+    rows = [
+        {**sample_row, "arize_space_role": "Nonexistent Role"},
+    ]
+    results = runner.run(rows)
+
+    # Not an error — a dry-run with a note.
+    assert results[0].status == "dry_run"
+    assert results[0].error_message == ""
+    assert "Nonexistent Role" in results[0].note
+    assert "does not exist" in results[0].note
+    # Warning surfaced in stdout (the runner's logger has propagate=False).
+    out = capsys.readouterr().out
+    assert "Row 1:" in out and "Nonexistent Role" in out
+    # No mapping was queued — pending stays empty, no createSAMLIdP/updateSAMLIdP.
+    assert runner.mappings_created == 0
+    ops = [op for op, _ in runner.saml._execute_graphql.calls]
+    assert "createSAMLIdP" not in ops
+    assert "updateSAMLIdP" not in ops
+
+
+def test_wet_run_errors_when_custom_role_missing(
+    mock_arize_client, rest_responses: RestResponses, sample_row
+) -> None:
+    """Wet run (dry_run=False) keeps the original error behavior — missing role → row errors."""
+    rest_responses.stub_list(
+        "/v2/organizations",
+        "organizations",
+        [{"id": "Org_acme", "name": "Acme Corp"}],
+    )
+    rest_responses.stub_list(
+        "/v2/spaces",
+        "spaces",
+        [{"id": "Space_ml", "name": "ML Platform"}],
+    )
+    rest_responses.stub_list(
+        "/v2/roles",
+        "roles",
+        [{"id": "Um9sZTox", "name": "Project Reviewer"}],
+    )
+    runner = _build_runner(mock_arize_client, dry_run=False)
+    _stage(runner, {"getSAMLIdP": _empty_idp_with_no_mappings()})
+
+    results = runner.run(
+        [{**sample_row, "arize_space_role": "Nonexistent Role"}]
+    )
+
+    assert results[0].status == "error"
+    assert "not found in this account" in results[0].error_message
+
+
 def test_verbose_sets_logger_to_debug() -> None:
     """8.3: --verbose flips the logger from INFO to DEBUG.
 

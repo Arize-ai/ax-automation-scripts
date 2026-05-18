@@ -36,4 +36,5 @@ OUTPUT_COLUMNS: list[str] = [
     "saml_attribute_value",
     "status",
     "error_message",
+    "note",
 ]

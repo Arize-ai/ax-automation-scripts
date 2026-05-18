@@ -11,6 +11,8 @@ class RowResult:
 
     `status` is one of: "created", "already_exists", "dry_run", "error".
     `error_message` is non-empty only when `status == "error"`.
+    `note` is a non-error advisory (e.g. legacy→custom auto-conversion) shown
+    in the results CSV alongside non-error statuses.
     """
 
     row_number: int
@@ -22,6 +24,7 @@ class RowResult:
     saml_attribute_value: str
     status: str = ""
     error_message: str = ""
+    note: str = ""
 
 
 @dataclass

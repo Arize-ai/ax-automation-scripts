@@ -8,10 +8,13 @@ GraphQL call at the end of the run.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 from .graphql_queries import CREATE_SAML_IDP, GET_SAML_IDP, UPDATE_SAML_IDP
 from .models import PendingSAMLMapping, SamlFlags
+
+if TYPE_CHECKING:
+    from .roles import RolesCache
 
 
 # Signature matches OrgSpaceService.execute_graphql: (query, variable_values, operation_name) → result
@@ -226,6 +229,36 @@ class SamlIdpService:
     def drop_pending(self, row_numbers: set[int]) -> None:
         """Remove pending mappings whose row failed in the preflight."""
         self._pending = [p for p in self._pending if p.row_number not in row_numbers]
+
+    def convert_legacy_to_custom(
+        self, row_number: int, space_id: str, roles: "RolesCache"
+    ) -> tuple[str, str] | None:
+        """Swap a pending legacy mapping for `(row_number, space_id)` to use a custom role.
+
+        Looks up — or creates on the account — the legacy-equivalent custom RBAC
+        role via `RolesCache.ensure_legacy_equivalent_role`, then mutates the
+        pending mapping in place so the eventual flush sends it under
+        `spaceRbacRolesMap` rather than `spaceRolesMap`.
+
+        Returns `(legacy_role_key, new_custom_role_name)` on success, or `None`
+        if no matching pending legacy mapping exists (e.g. the row was an
+        already_exists exact-match rather than a queued mapping).
+        """
+        for p in self._pending:
+            if (
+                p.row_number == row_number
+                and p.space_id == space_id
+                and p.space_role
+                and not p.space_rbac_role_id
+            ):
+                legacy_key = p.space_role
+                relay_id, custom_name = roles.ensure_legacy_equivalent_role(
+                    legacy_key
+                )
+                p.space_rbac_role_id = relay_id
+                p.space_role = ""
+                return legacy_key, custom_name
+        return None
 
     def strip_space(self, space_id: str, key: str) -> None:
         """Remove a space's entries from existing IdP mappings under `key`

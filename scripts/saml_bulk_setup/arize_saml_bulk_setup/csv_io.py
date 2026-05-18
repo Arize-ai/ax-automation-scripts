@@ -57,5 +57,6 @@ def write_results_csv(results: list[RowResult], output_path: str) -> None:
                     "saml_attribute_value": r.saml_attribute_value,
                     "status": r.status,
                     "error_message": r.error_message,
+                    "note": r.note,
                 }
             )

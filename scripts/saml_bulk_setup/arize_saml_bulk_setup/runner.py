@@ -85,6 +85,7 @@ class BulkSetupRunner:
         self.spaces_existed = 0
         self.mappings_created = 0
         self.mappings_existed = 0
+        self.legacy_auto_conversions = 0
         self._counted_orgs: set[str] = set()
         self._counted_spaces: set[str] = set()
 
@@ -139,11 +140,27 @@ class BulkSetupRunner:
             # SAML is loaded by run()'s pre-flight before any row reaches here.
 
             # Resolve a custom RBAC role (if any) to its relay global ID.
-            space_rbac_role_id = (
-                self.roles.resolve_custom_space_role(arize_space_role_raw)
-                if is_custom_space_role
-                else ""
-            )
+            space_rbac_role_id = ""
+            if is_custom_space_role:
+                try:
+                    space_rbac_role_id = self.roles.resolve_custom_space_role(
+                        arize_space_role_raw
+                    )
+                except ValueError as exc:
+                    if not self.dry_run:
+                        raise
+                    # Dry-run: warn but don't fail the row. Skip queuing the
+                    # mapping since we don't have a relay ID, and let the
+                    # operator fix the CSV (or create the role) before rerunning.
+                    self.logger.warning("Row %d: %s", row_number, exc)
+                    result.status = "dry_run"
+                    result.note = (
+                        f"Custom role '{arize_space_role_raw}' does not exist on "
+                        "this account — this row would fail in a real run. "
+                        "Create the role in the Arize UI or fix the CSV name, "
+                        "then rerun."
+                    )
+                    return result
 
             self._process_saml_mapping(
                 result=result,
@@ -324,14 +341,32 @@ class BulkSetupRunner:
             results.append(self.process_row(row, i))
 
         # Client-side check that mirrors the backend rule: a space can use
-        # either standard or custom roles across mappings, but not both. Drops
-        # offending pending rows so the flush succeeds for the rest of the batch.
+        # either standard or custom roles across mappings, but not both.
+        # When a CSV-internal mix is found, auto-create the legacy-equivalent
+        # custom role and swap the legacy pending mappings to use it; other
+        # conflict shapes still produce errors and drop the offending rows.
+        results_by_row = {r.row_number: r for r in results}
+
+        def _on_legacy_converted(
+            row_number: int, legacy_key: str, custom_name: str
+        ) -> None:
+            self.legacy_auto_conversions += 1
+            r = results_by_row.get(row_number)
+            if r is not None:
+                r.note = (
+                    f"Auto-converted legacy '{legacy_key}' to custom role "
+                    f"'{custom_name}' because this space also uses a custom role "
+                    "in another mapping."
+                )
+
         resolve_role_type_conflicts(
             saml=self.saml,
             space_id_to_name=self.orgs_spaces.space_id_to_name(),
             results=results,
             logger=self.logger,
             on_existed_to_error=self._decrement_existed_on_error,
+            roles=self.roles,
+            on_legacy_converted=_on_legacy_converted,
         )
 
         if self.dry_run:

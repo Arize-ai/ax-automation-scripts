@@ -32,6 +32,11 @@ def print_summary(
     print(
         f"  SAML mappings : {runner.mappings_created} created, {runner.mappings_existed} already existed"
     )
+    if runner.legacy_auto_conversions:
+        print(
+            f"  Auto-converts : {runner.legacy_auto_conversions} legacy role(s) "
+            "converted to custom equivalents for cross-mapping compatibility"
+        )
     if errors:
         print(f"  Errors        : {len(errors)} row(s) failed — review {output_path}")
     else:
