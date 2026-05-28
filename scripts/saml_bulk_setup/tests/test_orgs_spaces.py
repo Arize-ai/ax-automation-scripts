@@ -162,10 +162,10 @@ def test_resolve_space_returns_cached_id_and_scopes_to_org(
     assert space_id == "Space_ml"
     assert status == "already_exists"
 
-    # GET /v2/spaces must have been scoped by organization_id query param.
+    # GET /v2/spaces must have been scoped by org_id query param.
     queries = _query_params(rest_responses._rsps, "/v2/spaces")
     assert len(queries) == 1
-    assert queries[0].get("organization_id") == "Org_acme"
+    assert queries[0].get("org_id") == "Org_acme"
 
 
 # ── Space create ─────────────────────────────────────────────────────────────

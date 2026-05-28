@@ -8,6 +8,9 @@ ARIZE_REST_API_URL = "https://api.arize.com"
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0  # seconds
 
+# Base64 prefix for relay global IDs of the form "Role:<int>".
+RELAY_ROLE_ID_PREFIX = "Um9sZTo"
+
 # CSV accepts "viewer" as a human-friendly alias; Arize GraphQL uses "readOnly".
 ROLE_ALIAS: dict[str, str] = {
     "admin": "admin",

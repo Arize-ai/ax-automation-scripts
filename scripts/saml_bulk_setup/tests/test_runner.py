@@ -421,6 +421,153 @@ def test_repeated_org_create_failure_short_circuits(
     assert create_org.call_count == 1
 
 
+# ── 8.10: reconcile against existing IdP (the user's reported scenario) ─────
+
+
+def _idp_with_existing_custom_mappings() -> dict:
+    """IdP with two existing custom-role mappings on NLP Research — mirrors
+    the user's run that triggered the duplicate-mapping bug.
+
+    - attrs=[["roles","arize-nlp-engineers"]] → spaceRbacRolesMap=[["S_nlp", Space Member]]
+    - attrs=[["roles","arize-nlp-leads"]]     → spaceRbacRolesMap=[["S_nlp", Testing Custom Role]]
+    """
+    return {
+        "account": {
+            "samlIdPs": {
+                "edges": [
+                    {
+                        "node": {
+                            "id": "Idp_existing",
+                            "emailDomainsList": [{"domain": "acme.com"}],
+                            "enforceSaml": False,
+                            "syncUserRoles": True,
+                            "signAuthn": False,
+                            "allowLoginWithDefaults": False,
+                            "roleMappings": [
+                                {
+                                    "id": "RM_engineers",
+                                    "attributesMap": [["roles", "arize-nlp-engineers"]],
+                                    "spaceRolesMap": [],
+                                    "spaceRbacRolesMap": [
+                                        ["S_nlp", "Um9sZTpNRU1CRVI="]
+                                    ],
+                                    "isAccountAdmin": False,
+                                    "orgRole": {"orgId": "Org_sub", "roleId": "member"},
+                                },
+                                {
+                                    "id": "RM_leads",
+                                    "attributesMap": [["roles", "arize-nlp-leads"]],
+                                    "spaceRolesMap": [],
+                                    "spaceRbacRolesMap": [
+                                        ["S_nlp", "Um9sZTpURVNUSU5H"]
+                                    ],
+                                    "isAccountAdmin": False,
+                                    "orgRole": {"orgId": "Org_sub", "roleId": "member"},
+                                },
+                            ],
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+
+def test_reconcile_idempotent_and_replace_against_existing_idp(
+    mock_arize_client, rest_responses: RestResponses
+) -> None:
+    """8.10 (the bug the user hit): existing IdP has custom-role mappings for
+    arize-nlp-engineers (Space Member) and arize-nlp-leads (Testing Custom Role)
+    on NLP Research. CSV row 1 asks for member (idempotent), CSV row 2 asks for
+    admin (replace). After run:
+
+      - Row 1: status='already_exists' with the idempotent note
+      - Row 2: status='created' with the 'replaced prior role' note
+      - updateSAMLIdP payload has exactly TWO mappings (no duplicates)
+      - The leads mapping's role is now Space Admin for NLP Research
+    """
+    rest_responses.stub_list(
+        "/v2/organizations",
+        "organizations",
+        [{"id": "Org_sub", "name": "Subsidiary Inc"}],
+    )
+    rest_responses.stub_list(
+        "/v2/spaces",
+        "spaces",
+        [{"id": "S_nlp", "name": "NLP Research"}],
+    )
+    # Custom roles cache for legacy-equivalent lookup.
+    rest_responses.stub_list(
+        "/v2/roles",
+        "roles",
+        [
+            {"id": "Um9sZTpNRU1CRVI=", "name": "Space Member"},
+            {"id": "Um9sZTpBRE1JTg==", "name": "Space Admin"},
+        ],
+    )
+    runner = _build_runner(mock_arize_client, dry_run=False)
+    _stage(
+        runner,
+        {
+            "getSAMLIdP": _idp_with_existing_custom_mappings(),
+            "updateSAMLIdP": {
+                "updateSAMLIdP": {
+                    "idp": {"id": "Idp_existing", "roleMappings": []},
+                    "error": None,
+                }
+            },
+        },
+    )
+
+    rows = [
+        {
+            "organization": "Subsidiary Inc",
+            "space": "NLP Research",
+            "arize_org_role": "member",
+            "arize_space_role": "member",  # legacy → Space Member custom (idempotent)
+            "saml_attribute_name": "roles",
+            "saml_attribute_value": "arize-nlp-engineers",
+        },
+        {
+            "organization": "Subsidiary Inc",
+            "space": "NLP Research",
+            "arize_org_role": "member",
+            "arize_space_role": "admin",  # legacy → Space Admin custom (replace)
+            "saml_attribute_name": "roles",
+            "saml_attribute_value": "arize-nlp-leads",
+        },
+    ]
+    results = runner.run(rows)
+
+    # Row statuses + notes
+    assert results[0].status == "already_exists"
+    assert "already covers this space" in results[0].note
+    assert results[1].status == "created"
+    assert "Replaced prior role" in results[1].note
+    assert "Um9sZTpURVNUSU5H" in results[1].note  # the old role
+
+    # updateSAMLIdP fired exactly once with EXACTLY two mappings (no duplicates)
+    update_calls = [c for c in runner.saml._execute_graphql.calls if c[0] == "updateSAMLIdP"]
+    assert len(update_calls) == 1
+    payload = update_calls[0][1]["input"]
+    mappings = payload["roleMappings"]["mappingsList"]
+    assert len(mappings) == 2
+
+    # Engineers mapping kept its original role
+    engineers = next(
+        m for m in mappings
+        if m["attributesMap"] == [["roles", "arize-nlp-engineers"]]
+    )
+    assert engineers["spaceRbacRolesMap"] == [["S_nlp", "Um9sZTpNRU1CRVI="]]
+
+    # Leads mapping's role was REPLACED to Space Admin
+    leads = next(
+        m for m in mappings
+        if m["attributesMap"] == [["roles", "arize-nlp-leads"]]
+    )
+    assert leads["spaceRbacRolesMap"] == [["S_nlp", "Um9sZTpBRE1JTg=="]]
+
+
 # ── 8.9: traceback suppressed at INFO, shown at DEBUG ────────────────────────
 
 

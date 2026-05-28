@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -29,7 +29,14 @@ class RowResult:
 
 @dataclass
 class PendingSAMLMapping:
-    """A new SAML role mapping queued for creation, tied back to a CSV row."""
+    """A new SAML role mapping queued for creation, tied back to a CSV row.
+
+    The primary `(space_id, space_role|space_rbac_role_id)` pair represents
+    the row that originated this entry. `extra_space_*_pairs` carry additional
+    space-role pairs folded in from sibling rows that share the same
+    `(attr_name, attr_value, org_role)`; they're emitted together as a single
+    mapping at flush time.
+    """
 
     row_number: int
     org_id: str
@@ -41,6 +48,10 @@ class PendingSAMLMapping:
     space_rbac_role_id: str  # custom RBAC role relay global ID (e.g. "Um9sZTo...")
     attr_name: str
     attr_value: str
+    # Filled in by SamlIdpService._collapse_pending_by_attributes when sibling
+    # rows are merged into this owner entry.
+    extra_space_rbac_pairs: list[tuple[str, str]] = field(default_factory=list)
+    extra_space_legacy_pairs: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass

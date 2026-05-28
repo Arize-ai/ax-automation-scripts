@@ -185,9 +185,8 @@ class OrgSpaceService:
             self._spaces_loaded_for.add(org_id)
             return
         self._logger.debug("Loading spaces for org '%s'…", org_name)
-        for space in self._get_paginated(
-            "/v2/spaces", "spaces", {"organization_id": org_id}
-        ):
+
+        for space in self._get_paginated("/v2/spaces", "spaces", {"org_id": org_id}):
             name = space.get("name")
             sid = space.get("id")
             if not name or not sid:

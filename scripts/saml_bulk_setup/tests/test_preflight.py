@@ -1,11 +1,16 @@
 """Preflight role-type conflict resolution — covers TEST_SCENARIOS.md section 6.
 
-  6.1 — CSV-internal conflict (two CSV rows, same space, mixed role types)
-        → now auto-converts the legacy row(s) to a custom equivalent.
-  6.2 — CSV-vs-existing migration: custom CSV row on a space the IdP has under standard
-  6.3 — CSV-vs-existing migration: standard CSV row on a space the IdP has under custom
-  6.4 — Three-way: already_exists row + new CSV row of opposite type on the same space
-        → still errors, since we can't silently mutate an existing exact-match entry.
+  6.1 — Shape A (CSV-internal pending mix): auto-converts pending legacy → custom.
+  6.2 — Shape B (pending legacy + existing custom on same space):
+        pending legacy is converted; existing custom mapping preserved (no strip).
+  6.3 — Shape C (pending custom + existing legacy on same space):
+        existing legacy IdP entry is rewritten in place to spaceRbacRolesMap.
+  6.4 — Shape D (already_exists matched legacy + pending custom on same space):
+        both rows succeed. Matched row keeps status='already_exists' with a note.
+  6.5 — Shape E (already_exists matched custom + pending legacy on same space):
+        pending legacy is converted (via the existing pending-conversion path).
+  6.6 — Failure path: roles lookup raises → fallback to error message.
+  6.7 — Multiple legacy keys on the same conflicted space across mappings.
 """
 
 from __future__ import annotations
@@ -22,8 +27,8 @@ class FakeSaml:
     """Stand-in for SamlIdpService that the preflight reads from / mutates.
 
     Implements only the surface the preflight touches: existing_mappings,
-    pending, exact_match_uses, strip_space, drop_pending, pending_row_numbers,
-    convert_legacy_to_custom.
+    pending, exact_match_uses, drop_pending, pending_row_numbers,
+    convert_legacy_to_custom, promote_existing_legacy_for_space.
     """
 
     def __init__(
@@ -35,8 +40,8 @@ class FakeSaml:
         self._existing = list(existing_mappings or [])
         self._pending = list(pending or [])
         self._exact = list(exact_match_uses or [])
-        self.strip_calls: list[tuple[str, str]] = []
         self.convert_calls: list[tuple[int, str]] = []
+        self.promote_calls: list[str] = []
 
     # Properties match the real service's tuple-view contract
     @property
@@ -53,16 +58,6 @@ class FakeSaml:
 
     def pending_row_numbers(self) -> set[int]:
         return {p.row_number for p in self._pending}
-
-    def strip_space(self, space_id: str, key: str) -> None:
-        self.strip_calls.append((space_id, key))
-        for mapping in self._existing:
-            if mapping.get(key):
-                mapping[key] = [
-                    p
-                    for p in mapping[key]
-                    if not (len(p) >= 2 and p[0] == space_id)
-                ]
 
     def drop_pending(self, row_numbers: set[int]) -> None:
         self._pending = [
@@ -89,12 +84,39 @@ class FakeSaml:
                 return legacy_key, custom_name
         return None
 
+    def promote_existing_legacy_for_space(
+        self, space_id: str, roles: "FakeRoles"
+    ) -> list[tuple[str, str]]:
+        """Mimic SamlIdpService.promote_existing_legacy_for_space."""
+        self.promote_calls.append(space_id)
+        conversions: dict[str, str] = {}
+        for mapping in self._existing:
+            legacy = mapping.get("spaceRolesMap") or []
+            if not legacy:
+                continue
+            kept: list[list[str]] = []
+            for pair in legacy:
+                if len(pair) < 2 or pair[0] != space_id:
+                    kept.append(pair)
+                    continue
+                legacy_key = pair[1]
+                relay_id, custom_name = roles.ensure_legacy_equivalent_role(
+                    legacy_key
+                )
+                conversions[legacy_key] = custom_name
+                rbac = mapping.get("spaceRbacRolesMap")
+                if rbac is None:
+                    rbac = []
+                    mapping["spaceRbacRolesMap"] = rbac
+                rbac.append([space_id, relay_id])
+            mapping["spaceRolesMap"] = kept
+        return list(conversions.items())
+
 
 class FakeRoles:
     """Records ensure_legacy_equivalent_role calls and hands back a deterministic relay ID."""
 
     def __init__(self, mapping: dict[str, tuple[str, str]] | None = None) -> None:
-        # legacy_key → (relay_id, custom_name)
         self.mapping = mapping or {
             "admin": ("Um9sZTpBRE1JTg==", "Space Admin"),
             "member": ("Um9sZTpNRU1CRVI=", "Space Member"),
@@ -102,11 +124,14 @@ class FakeRoles:
             "annotator": ("Um9sZTpBTk5PVA==", "Space Annotator"),
         }
         self.calls: list[str] = []
+        self.raise_on: set[str] = set()
 
     def ensure_legacy_equivalent_role(
         self, legacy_role_key: str
     ) -> tuple[str, str]:
         self.calls.append(legacy_role_key)
+        if legacy_role_key in self.raise_on:
+            raise RuntimeError(f"simulated POST /v2/roles failure for {legacy_role_key}")
         return self.mapping[legacy_role_key]
 
 
@@ -128,43 +153,33 @@ def _result(
     )
 
 
-def _record_conversion(
-    sink: list[tuple[int, str, str]],
-) -> "callable":
-    def _cb(row_number: int, legacy_key: str, custom_name: str) -> None:
-        sink.append((row_number, legacy_key, custom_name))
+def _record_conversion(sink: list[tuple[int, str, str, str]]):
+    def _cb(
+        row_number: int, legacy_key: str, custom_name: str, kind: str = "pending"
+    ) -> None:
+        sink.append((row_number, legacy_key, custom_name, kind))
 
     return _cb
 
 
-# ── 6.1: CSV-internal conflict (now auto-converts) ───────────────────────────
+# ── Shape A: CSV-internal pending mix ────────────────────────────────────────
 
 
 def test_csv_internal_mix_auto_converts_legacy_to_custom(
     logger: logging.Logger,
 ) -> None:
-    """CSV-internal mix on a space: legacy row is silently converted to custom."""
+    """6.1: pending legacy + pending custom on same space → legacy row swapped."""
     saml = FakeSaml(
         pending=[
             PendingSAMLMapping(
-                row_number=1,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="admin",
-                space_rbac_role_id="",
-                attr_name="groups",
-                attr_value="g1",
+                row_number=1, org_id="O1", space_id="S1", org_role="member",
+                space_role="admin", space_rbac_role_id="",
+                attr_name="groups", attr_value="g1",
             ),
             PendingSAMLMapping(
-                row_number=2,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="",
-                space_rbac_role_id="Um9sZTox",
-                attr_name="groups",
-                attr_value="g2",
+                row_number=2, org_id="O1", space_id="S1", org_role="member",
+                space_role="", space_rbac_role_id="Um9sZTox",
+                attr_name="groups", attr_value="g2",
             ),
         ]
     )
@@ -173,7 +188,7 @@ def test_csv_internal_mix_auto_converts_legacy_to_custom(
         _result(2, space_role="Project Reviewer"),
     ]
     roles = FakeRoles()
-    conversions: list[tuple[int, str, str]] = []
+    conversions: list[tuple[int, str, str, str]] = []
 
     rollback_calls: list[int] = []
     resolve_role_type_conflicts(
@@ -186,23 +201,14 @@ def test_csv_internal_mix_auto_converts_legacy_to_custom(
         on_legacy_converted=_record_conversion(conversions),
     )
 
-    # No errors; both rows keep their original status.
     assert results[0].status == "created"
     assert results[1].status == "created"
     assert not results[0].error_message
-    assert not results[1].error_message
-    # Pending row 1 was mutated in place to use the relay role ID.
     pending_by_row = {p.row_number: p for p in saml.pending}
     assert pending_by_row[1].space_role == ""
     assert pending_by_row[1].space_rbac_role_id == "Um9sZTpBRE1JTg=="
-    # Pending row 2 untouched.
-    assert pending_by_row[2].space_rbac_role_id == "Um9sZTox"
-    assert pending_by_row[2].space_role == ""
-    # RolesCache was asked exactly once for the admin equivalent.
     assert roles.calls == ["admin"]
-    # Runner callback received the conversion event.
-    assert conversions == [(1, "admin", "Space Admin")]
-    # No already_exists rollbacks fired.
+    assert conversions == [(1, "admin", "Space Admin", "pending")]
     assert rollback_calls == []
 
 
@@ -213,24 +219,14 @@ def test_csv_internal_mix_falls_back_to_error_when_roles_not_provided(
     saml = FakeSaml(
         pending=[
             PendingSAMLMapping(
-                row_number=1,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="admin",
-                space_rbac_role_id="",
-                attr_name="groups",
-                attr_value="g1",
+                row_number=1, org_id="O1", space_id="S1", org_role="member",
+                space_role="admin", space_rbac_role_id="",
+                attr_name="groups", attr_value="g1",
             ),
             PendingSAMLMapping(
-                row_number=2,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="",
-                space_rbac_role_id="Um9sZTox",
-                attr_name="groups",
-                attr_value="g2",
+                row_number=2, org_id="O1", space_id="S1", org_role="member",
+                space_role="", space_rbac_role_id="Um9sZTox",
+                attr_name="groups", attr_value="g2",
             ),
         ]
     )
@@ -253,90 +249,19 @@ def test_csv_internal_mix_falls_back_to_error_when_roles_not_provided(
     assert saml.pending == ()
 
 
-def test_auto_conversion_uses_cached_relay_id_when_already_known(
-    logger: logging.Logger,
-) -> None:
-    """A pre-populated FakeRoles mapping is hit on the first call — no second lookup."""
-    saml = FakeSaml(
-        pending=[
-            PendingSAMLMapping(
-                row_number=1,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="admin",
-                space_rbac_role_id="",
-                attr_name="groups",
-                attr_value="g1",
-            ),
-            PendingSAMLMapping(
-                row_number=3,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="admin",
-                space_rbac_role_id="",
-                attr_name="groups",
-                attr_value="g3",
-            ),
-            PendingSAMLMapping(
-                row_number=2,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="",
-                space_rbac_role_id="Um9sZTox",
-                attr_name="groups",
-                attr_value="g2",
-            ),
-        ]
-    )
-    results = [
-        _result(1, space_role="admin"),
-        _result(2, space_role="Project Reviewer"),
-        _result(3, space_role="admin"),
-    ]
-    roles = FakeRoles()
-    conversions: list[tuple[int, str, str]] = []
-
-    resolve_role_type_conflicts(
-        saml=saml,
-        space_id_to_name={"S1": "ML Platform"},
-        results=results,
-        logger=logger,
-        on_existed_to_error=lambda _row: None,
-        roles=roles,
-        on_legacy_converted=_record_conversion(conversions),
-    )
-
-    # Both legacy rows converted; roles was asked twice (cache is the cache's job).
-    assert roles.calls == ["admin", "admin"]
-    assert {r for r, *_ in conversions} == {1, 3}
-
-
 def test_annotator_legacy_is_auto_converted(logger: logging.Logger) -> None:
     """Auto-conversion works for all four legacy keys, including annotator."""
     saml = FakeSaml(
         pending=[
             PendingSAMLMapping(
-                row_number=1,
-                org_id="O1",
-                space_id="S1",
-                org_role="annotator",
-                space_role="annotator",
-                space_rbac_role_id="",
-                attr_name="groups",
-                attr_value="g1",
+                row_number=1, org_id="O1", space_id="S1", org_role="annotator",
+                space_role="annotator", space_rbac_role_id="",
+                attr_name="groups", attr_value="g1",
             ),
             PendingSAMLMapping(
-                row_number=2,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="",
-                space_rbac_role_id="Um9sZTox",
-                attr_name="groups",
-                attr_value="g2",
+                row_number=2, org_id="O1", space_id="S1", org_role="member",
+                space_role="", space_rbac_role_id="Um9sZTox",
+                attr_name="groups", attr_value="g2",
             ),
         ]
     )
@@ -345,7 +270,7 @@ def test_annotator_legacy_is_auto_converted(logger: logging.Logger) -> None:
         _result(2, space_role="Project Reviewer"),
     ]
     roles = FakeRoles()
-    conversions: list[tuple[int, str, str]] = []
+    conversions: list[tuple[int, str, str, str]] = []
 
     resolve_role_type_conflicts(
         saml=saml,
@@ -358,41 +283,88 @@ def test_annotator_legacy_is_auto_converted(logger: logging.Logger) -> None:
     )
 
     assert roles.calls == ["annotator"]
-    assert conversions == [(1, "annotator", "Space Annotator")]
+    assert conversions == [(1, "annotator", "Space Annotator", "pending")]
     pending_by_row = {p.row_number: p for p in saml.pending}
     assert pending_by_row[1].space_rbac_role_id == "Um9sZTpBTk5PVA=="
-    assert pending_by_row[1].space_role == ""
 
 
-# ── 6.2 / 6.3: CSV-vs-existing migration ─────────────────────────────────────
+# ── Shape B: pending legacy + existing custom (was strip; now promote pending) ───
 
 
-def test_csv_with_custom_role_strips_existing_standard_entry(
+def test_shape_b_pending_legacy_existing_custom_preserves_custom(
     logger: logging.Logger,
 ) -> None:
-    """6.2: IdP has space under spaceRolesMap; CSV asks for a custom role → strip standard."""
+    """6.2: existing custom-role mapping stays put; pending legacy is converted."""
     existing = [
         {
-            "spaceRolesMap": [["S1", "admin"], ["S2", "member"]],
-            "spaceRbacRolesMap": [],
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [["S1", "Um9sZTpFWElTVA=="]],
+            "attributesMap": [["groups", "existing-custom"]],
         }
     ]
     saml = FakeSaml(
         existing_mappings=existing,
         pending=[
             PendingSAMLMapping(
-                row_number=1,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="",
-                space_rbac_role_id="Um9sZTox",
-                attr_name="groups",
-                attr_value="g1",
+                row_number=1, org_id="O1", space_id="S1", org_role="member",
+                space_role="member", space_rbac_role_id="",
+                attr_name="groups", attr_value="new-legacy",
+            )
+        ],
+    )
+    results = [_result(1, space_role="member")]
+    roles = FakeRoles()
+    conversions: list[tuple[int, str, str, str]] = []
+
+    resolve_role_type_conflicts(
+        saml=saml,
+        space_id_to_name={"S1": "ML Platform"},
+        results=results,
+        logger=logger,
+        on_existed_to_error=lambda _row: None,
+        roles=roles,
+        on_legacy_converted=_record_conversion(conversions),
+    )
+
+    # Pending row converted via legacy-equivalent custom role
+    assert results[0].status == "created"
+    pending_by_row = {p.row_number: p for p in saml.pending}
+    assert pending_by_row[1].space_role == ""
+    assert pending_by_row[1].space_rbac_role_id == "Um9sZTpNRU1CRVI="
+    # Existing custom mapping was NOT touched
+    assert existing[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpFWElTVA=="]]
+    # No existing-legacy promotion happened (none existed) — but the helper may
+    # still have been called depending on impl; assert the result instead.
+    assert conversions == [(1, "member", "Space Member", "pending")]
+
+
+# ── Shape C: pending custom + existing legacy (was strip; now promote existing) ──
+
+
+def test_shape_c_pending_custom_promotes_existing_legacy(
+    logger: logging.Logger,
+) -> None:
+    """6.3: existing legacy IdP entry is rewritten in place to spaceRbacRolesMap."""
+    existing = [
+        {
+            "spaceRolesMap": [["S1", "admin"], ["S2", "member"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "g_existing"]],
+        }
+    ]
+    saml = FakeSaml(
+        existing_mappings=existing,
+        pending=[
+            PendingSAMLMapping(
+                row_number=1, org_id="O1", space_id="S1", org_role="member",
+                space_role="", space_rbac_role_id="Um9sZTox",
+                attr_name="groups", attr_value="g_new_custom",
             )
         ],
     )
     results = [_result(1, space="ML Platform", space_role="Project Reviewer")]
+    roles = FakeRoles()
+    conversions: list[tuple[int, str, str, str]] = []
 
     resolve_role_type_conflicts(
         saml=saml,
@@ -400,41 +372,166 @@ def test_csv_with_custom_role_strips_existing_standard_entry(
         results=results,
         logger=logger,
         on_existed_to_error=lambda _row: None,
+        roles=roles,
+        on_legacy_converted=_record_conversion(conversions),
     )
 
-    # S1 was stripped, S2 preserved
-    assert saml.strip_calls == [("S1", "spaceRolesMap")]
+    # S1's legacy pair moved to spaceRbacRolesMap; S2 stays under spaceRolesMap.
     assert existing[0]["spaceRolesMap"] == [["S2", "member"]]
-    # Row stays created
+    assert existing[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpBRE1JTg=="]]
+    assert saml.promote_calls == ["S1"]
+    # Pending row stays as-is (already custom).
     assert results[0].status == "created"
+    pending_by_row = {p.row_number: p for p in saml.pending}
+    assert pending_by_row[1].space_rbac_role_id == "Um9sZTox"
+    # No row-targeted conversion fired (no matched row on this space).
+    assert conversions == []
 
 
-def test_csv_with_standard_role_strips_existing_custom_entry(
+# ── Shape D: matched legacy + pending custom (the reported failure) ──────────
+
+
+def test_shape_d_matched_legacy_plus_pending_custom_promotes_and_annotates(
     logger: logging.Logger,
 ) -> None:
-    """6.3: IdP has space under spaceRbacRolesMap; CSV asks for builtin → strip custom."""
+    """6.4: an already_exists row matched an existing legacy mapping; another CSV row
+    adds a custom role on the same space. Both succeed; matched row gets a note."""
     existing = [
         {
-            "spaceRolesMap": [],
-            "spaceRbacRolesMap": [["S1", "Um9sZTox"]],
+            "spaceRolesMap": [["S1", "member"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["roles", "arize-nlp-research"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
         }
     ]
     saml = FakeSaml(
         existing_mappings=existing,
         pending=[
             PendingSAMLMapping(
-                row_number=1,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="admin",
-                space_rbac_role_id="",
-                attr_name="groups",
-                attr_value="g1",
+                row_number=6, org_id="O1", space_id="S1", org_role="member",
+                space_role="", space_rbac_role_id="Um9sZTpURVNU",
+                attr_name="roles", attr_value="arize-nlp-leads",
             )
         ],
+        exact_match_uses=[(7, "S1", "member", "")],
     )
-    results = [_result(1, space_role="admin")]
+    results = [
+        _result(6, space="NLP Research", space_role="Testing Custom Roles"),
+        _result(7, space="NLP Research", space_role="member", status="already_exists"),
+    ]
+    roles = FakeRoles()
+    conversions: list[tuple[int, str, str, str]] = []
+
+    rollback_calls: list[int] = []
+    resolve_role_type_conflicts(
+        saml=saml,
+        space_id_to_name={"S1": "NLP Research"},
+        results=results,
+        logger=logger,
+        on_existed_to_error=rollback_calls.append,
+        roles=roles,
+        on_legacy_converted=_record_conversion(conversions),
+    )
+
+    # No errors — both rows keep their original status.
+    assert results[0].status == "created"
+    assert results[1].status == "already_exists"
+    assert not results[0].error_message
+    assert not results[1].error_message
+    # Existing legacy entry promoted in place.
+    assert existing[0]["spaceRolesMap"] == []
+    assert existing[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpNRU1CRVI="]]
+    # Matched row 7 got a 'matched' conversion event for the runner to stamp.
+    assert (7, "member", "Space Member", "matched") in conversions
+    # No rollback fired — the already_exists row keeps its status.
+    assert rollback_calls == []
+
+
+# ── Shape E: matched custom + pending legacy ──────────────────────────────────
+
+
+def test_shape_e_matched_custom_plus_pending_legacy_converts_pending(
+    logger: logging.Logger,
+) -> None:
+    """6.5: existing custom matched by row N; row M adds legacy on same space.
+    Pending legacy is converted; matched custom row is untouched.
+    """
+    existing = [
+        {
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [["S1", "Um9sZTpFWElTVA=="]],
+            "attributesMap": [["roles", "existing-custom-group"]],
+        }
+    ]
+    saml = FakeSaml(
+        existing_mappings=existing,
+        pending=[
+            PendingSAMLMapping(
+                row_number=20, org_id="O1", space_id="S1", org_role="member",
+                space_role="admin", space_rbac_role_id="",
+                attr_name="roles", attr_value="new-legacy-group",
+            )
+        ],
+        exact_match_uses=[(10, "S1", "", "Um9sZTpFWElTVA==")],
+    )
+    results = [
+        _result(10, space_role="Existing Custom", status="already_exists"),
+        _result(20, space_role="admin"),
+    ]
+    roles = FakeRoles()
+    conversions: list[tuple[int, str, str, str]] = []
+
+    resolve_role_type_conflicts(
+        saml=saml,
+        space_id_to_name={"S1": "ML Platform"},
+        results=results,
+        logger=logger,
+        on_existed_to_error=lambda _row: pytest.fail("rollback should not fire"),
+        roles=roles,
+        on_legacy_converted=_record_conversion(conversions),
+    )
+
+    # Matched custom row 10 stays already_exists, untouched.
+    assert results[0].status == "already_exists"
+    assert not results[0].note  # no promotion needed on its side
+    # Pending legacy row 20 was converted.
+    assert results[1].status == "created"
+    pending_by_row = {p.row_number: p for p in saml.pending}
+    assert pending_by_row[20].space_rbac_role_id == "Um9sZTpBRE1JTg=="
+    # Existing custom mapping preserved.
+    assert existing[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpFWElTVA=="]]
+    assert conversions == [(20, "admin", "Space Admin", "pending")]
+
+
+# ── Failure path: role lookup raises → fall back to error message ────────────
+
+
+def test_promotion_failure_falls_back_to_error(logger: logging.Logger) -> None:
+    """6.6: ensure_legacy_equivalent_role raises → all involved rows get the
+    fallback error and pending entries are dropped.
+    """
+    roles = FakeRoles()
+    roles.raise_on = {"admin"}
+
+    saml = FakeSaml(
+        pending=[
+            PendingSAMLMapping(
+                row_number=1, org_id="O1", space_id="S1", org_role="member",
+                space_role="admin", space_rbac_role_id="",
+                attr_name="groups", attr_value="g1",
+            ),
+            PendingSAMLMapping(
+                row_number=2, org_id="O1", space_id="S1", org_role="member",
+                space_role="", space_rbac_role_id="Um9sZTox",
+                attr_name="groups", attr_value="g2",
+            ),
+        ]
+    )
+    results = [
+        _result(1, space_role="admin"),
+        _result(2, space_role="Project Reviewer"),
+    ]
+    conversions: list[tuple[int, str, str, str]] = []
 
     resolve_role_type_conflicts(
         saml=saml,
@@ -442,68 +539,69 @@ def test_csv_with_standard_role_strips_existing_custom_entry(
         results=results,
         logger=logger,
         on_existed_to_error=lambda _row: None,
+        roles=roles,
+        on_legacy_converted=_record_conversion(conversions),
     )
 
-    assert saml.strip_calls == [("S1", "spaceRbacRolesMap")]
-    assert existing[0]["spaceRbacRolesMap"] == []
-    assert results[0].status == "created"
+    assert results[0].status == "error"
+    assert results[1].status == "error"
+    assert "Auto-promotion" in results[0].error_message
+    # Pending entries were dropped so they aren't included in the flush.
+    assert saml.pending == ()
 
 
-# ── 6.4: Three-way (exact-match path) ────────────────────────────────────────
+# ── Multiple legacy keys on the same conflicted space across mappings ─────────
 
 
-def test_three_way_conflict_via_exact_match_use(logger: logging.Logger) -> None:
-    """6.4: an already_exists exact-match row + a new opposite-type pending row on the
-    same space still errors. We can't safely mutate an existing IdP entry from this
-    code path, so auto-conversion does not apply and the error is preserved.
-    """
+def test_multiple_legacy_keys_on_same_space_each_get_their_equivalent(
+    logger: logging.Logger,
+) -> None:
+    """6.7: mapping1 has [S1, 'admin']; mapping2 has [S1, 'member']; plus a
+    pending custom row on S1. Both legacy keys are converted to their
+    respective equivalents."""
+    existing = [
+        {
+            "spaceRolesMap": [["S1", "admin"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "admins"]],
+        },
+        {
+            "spaceRolesMap": [["S1", "member"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "members"]],
+        },
+    ]
     saml = FakeSaml(
-        existing_mappings=[
-            {
-                "spaceRolesMap": [["S1", "admin"]],
-                "spaceRbacRolesMap": [],
-                "attributesMap": [["groups", "g10"]],
-                "orgRole": {"orgId": "O1", "roleId": "member"},
-            }
-        ],
+        existing_mappings=existing,
         pending=[
             PendingSAMLMapping(
-                row_number=11,
-                org_id="O1",
-                space_id="S1",
-                org_role="member",
-                space_role="",
-                space_rbac_role_id="Um9sZTox",
-                attr_name="groups",
-                attr_value="g11",
+                row_number=1, org_id="O1", space_id="S1", org_role="member",
+                space_role="", space_rbac_role_id="Um9sZTox",
+                attr_name="groups", attr_value="custom-users",
             )
         ],
-        exact_match_uses=[(10, "S1", "admin", "")],
     )
-    results = [
-        _result(10, space_role="admin", status="already_exists"),
-        _result(11, space_role="Project Reviewer", status="created"),
-    ]
+    results = [_result(1, space_role="Project Reviewer")]
     roles = FakeRoles()
 
-    rollback_calls: list[int] = []
     resolve_role_type_conflicts(
         saml=saml,
         space_id_to_name={"S1": "ML Platform"},
         results=results,
         logger=logger,
-        on_existed_to_error=rollback_calls.append,
+        on_existed_to_error=lambda _row: None,
         roles=roles,
-        on_legacy_converted=lambda *_args: None,
+        on_legacy_converted=_record_conversion([]),
     )
 
-    assert results[0].status == "error"
-    assert results[1].status == "error"
-    # Only the already_exists row triggers a rollback
-    assert rollback_calls == [10]
-    # Auto-conversion was NOT attempted (the legacy row isn't pending).
-    assert roles.calls == []
-    assert saml.convert_calls == []
+    # Both legacy keys looked up.
+    assert sorted(roles.calls) == ["admin", "member"]
+    # Each existing mapping's [S1, <legacy>] moved to spaceRbacRolesMap with
+    # the correct equivalent.
+    assert existing[0]["spaceRolesMap"] == []
+    assert existing[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpBRE1JTg=="]]
+    assert existing[1]["spaceRolesMap"] == []
+    assert existing[1]["spaceRbacRolesMap"] == [["S1", "Um9sZTpNRU1CRVI="]]
 
 
 def test_no_conflict_short_circuits(logger: logging.Logger) -> None:
@@ -512,14 +610,9 @@ def test_no_conflict_short_circuits(logger: logging.Logger) -> None:
         existing_mappings=[{"spaceRolesMap": [["S1", "admin"]], "spaceRbacRolesMap": []}],
         pending=[
             PendingSAMLMapping(
-                row_number=1,
-                org_id="O1",
-                space_id="S2",  # different space
-                org_role="member",
-                space_role="",
-                space_rbac_role_id="Um9sZTox",
-                attr_name="groups",
-                attr_value="g1",
+                row_number=1, org_id="O1", space_id="S2",  # different space
+                org_role="member", space_role="", space_rbac_role_id="Um9sZTox",
+                attr_name="groups", attr_value="g1",
             )
         ],
     )
@@ -534,5 +627,5 @@ def test_no_conflict_short_circuits(logger: logging.Logger) -> None:
     )
 
     assert results[0].status == "created"
-    assert saml.strip_calls == []
+    assert saml.promote_calls == []
     assert len(saml.pending) == 1

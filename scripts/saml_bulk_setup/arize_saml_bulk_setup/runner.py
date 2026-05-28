@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from .config import ARIZE_APP_URL, ROLE_ALIAS, VALID_ORG_ROLES
+from .config import ARIZE_APP_URL, RELAY_ROLE_ID_PREFIX, ROLE_ALIAS, VALID_ORG_ROLES
 from .models import PendingSAMLMapping, RowResult
 from .orgs_spaces import OrgSpaceService
 from .preflight import resolve_role_type_conflicts
@@ -342,17 +342,29 @@ class BulkSetupRunner:
 
         # Client-side check that mirrors the backend rule: a space can use
         # either standard or custom roles across mappings, but not both.
-        # When a CSV-internal mix is found, auto-create the legacy-equivalent
-        # custom role and swap the legacy pending mappings to use it; other
-        # conflict shapes still produce errors and drop the offending rows.
+        # Whenever a conflict touches a space the CSV references, every legacy
+        # use on that space (pending row, already_exists match, or pre-existing
+        # IdP entry) is promoted to a custom RBAC role mirroring its permission
+        # set. Custom is never demoted to legacy.
         results_by_row = {r.row_number: r for r in results}
 
         def _on_legacy_converted(
-            row_number: int, legacy_key: str, custom_name: str
+            row_number: int,
+            legacy_key: str,
+            custom_name: str,
+            kind: str = "pending",
         ) -> None:
             self.legacy_auto_conversions += 1
             r = results_by_row.get(row_number)
-            if r is not None:
+            if r is None:
+                return
+            if kind == "matched":
+                r.note = (
+                    f"Existing legacy mapping was auto-promoted to custom role "
+                    f"'{custom_name}' because another mapping on this space "
+                    "uses a custom role."
+                )
+            else:
                 r.note = (
                     f"Auto-converted legacy '{legacy_key}' to custom role "
                     f"'{custom_name}' because this space also uses a custom role "
@@ -369,11 +381,97 @@ class BulkSetupRunner:
             on_legacy_converted=_on_legacy_converted,
         )
 
+        # Reconcile any pending mappings against the (possibly preflight-mutated)
+        # existing IdP state. Pending entries that match an existing mapping
+        # by (attr, val, org_role) get absorbed in-place; their rows are
+        # re-classified or annotated below.
+        def _on_absorbed(
+            row_number: int,
+            kind: str,
+            attr_name: str,
+            attr_value: str,
+            prior_role_label: str,
+        ) -> None:
+            r = results_by_row.get(row_number)
+            if r is None:
+                return
+            attr_pair = f"{attr_name}={attr_value}"
+            display_prior = (
+                self.roles.id_to_name(prior_role_label)
+                if prior_role_label and prior_role_label.startswith(RELAY_ROLE_ID_PREFIX)
+                else prior_role_label
+            )
+            if kind == "idempotent":
+                r.status = "already_exists"
+                r.note = (
+                    f"Existing SAML mapping already covers this space with "
+                    f"the same role; no change needed."
+                )
+                self.mappings_existed += 1
+                self.logger.info(
+                    "Row %d: existing SAML mapping for %s already covers this space with the same role; no change needed.",
+                    row_number,
+                    attr_pair,
+                )
+            elif kind == "inherited":
+                r.status = "already_exists"
+                r.note = (
+                    f"Existing SAML mapping for {attr_pair} already covers "
+                    f"this org role."
+                )
+                self.mappings_existed += 1
+                self.logger.info(
+                    "Row %d: existing SAML mapping for %s already covers this org role; no change needed.",
+                    row_number,
+                    attr_pair,
+                )
+            elif kind == "replaced":
+                # Status stays 'created' — the IdP state changed.
+                r.note = (
+                    f"Replaced prior role '{display_prior}' on this space "
+                    f"in the existing SAML mapping for {attr_pair}."
+                )
+                self.logger.info(
+                    "Row %d: replaced prior role '%s' on this space in existing SAML mapping for %s.",
+                    row_number,
+                    display_prior,
+                    attr_pair,
+                )
+            elif kind == "extended":
+                r.note = (
+                    f"Added this space to the existing SAML mapping for "
+                    f"{attr_pair}."
+                )
+                self.logger.info(
+                    "Row %d: added this space to existing SAML mapping for %s.",
+                    row_number,
+                    attr_pair,
+                )
+
+        def _on_merged(
+            row_number: int,
+            owner_row_number: int,
+            attr_name: str,
+            attr_value: str,
+        ) -> None:
+            r = results_by_row.get(row_number)
+            if r is None:
+                return
+            r.note = (
+                f"Merged into a single SAML mapping with row {owner_row_number} "
+                f"(same {attr_name}={attr_value} attribute pair)."
+            )
+
+        self.saml.reconcile_pending_into_existing(on_absorbed=_on_absorbed)
+        self.saml.collapse_pending_by_attributes(on_merged=_on_merged)
+
         if self.dry_run:
             self.mappings_created = self.saml.pending_count()
             return results
 
-        if not self.saml.has_pending():
+        # Nothing to flush: no new mappings AND no in-place changes to existing
+        # ones (reconcile may have absorbed everything as idempotent).
+        if not self.saml.needs_flush():
             return results
 
         pending_rows = self.saml.pending_row_numbers()
@@ -381,7 +479,14 @@ class BulkSetupRunner:
         try:
             self.saml.flush()
             self.mappings_created += created_count
-            self.logger.info("%d new SAML mapping(s) created.", created_count)
+            if created_count:
+                self.logger.info(
+                    "%d new SAML mapping(s) created.", created_count
+                )
+            else:
+                self.logger.info(
+                    "SAML mappings updated in place (no new mappings added)."
+                )
         except Exception as exc:
             self.logger.exception("Failed to flush SAML mappings: %s", exc)
             for r in results:

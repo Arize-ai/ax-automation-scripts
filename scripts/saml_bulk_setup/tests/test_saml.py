@@ -336,3 +336,498 @@ def test_mapping_exists_matches_existing_inherited_entry(
         attr_name="groups",
         attr_value="g1",
     )
+
+
+# ── promote_existing_legacy_for_space ────────────────────────────────────────
+
+
+class _FakeRolesForPromotion:
+    """Minimal RolesCache stand-in for promote_existing_legacy_for_space tests."""
+
+    def __init__(self) -> None:
+        self.mapping = {
+            "admin": ("Um9sZTpBRE1JTg==", "Space Admin"),
+            "member": ("Um9sZTpNRU1CRVI=", "Space Member"),
+            "readOnly": ("Um9sZTpSRUFE", "Space Read-Only"),
+            "annotator": ("Um9sZTpBTk5PVA==", "Space Annotator"),
+        }
+        self.calls: list[str] = []
+
+    def ensure_legacy_equivalent_role(self, legacy_key: str) -> tuple[str, str]:
+        self.calls.append(legacy_key)
+        return self.mapping[legacy_key]
+
+
+def _saml_with_existing(
+    fake_executor, logger: logging.Logger, mappings: list[dict]
+):
+    """Helper: build a SamlIdpService and seed it with the given existing mappings.
+
+    Avoids the full ensure_loaded → GraphQL round-trip; we only need the
+    `_existing_mappings` list populated for these tests.
+    """
+    saml = _saml(fake_executor, logger)
+    saml._existing_mappings = mappings  # noqa: SLF001 — test-only seam
+    saml._idp_id = "Idp_existing"  # noqa: SLF001
+    return saml
+
+
+def test_promote_existing_legacy_single_mapping(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Single mapping with one legacy entry for the space — pair moved to RBAC."""
+    mappings = [
+        {
+            "spaceRolesMap": [["S1", "member"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "g1"]],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    roles = _FakeRolesForPromotion()
+
+    conversions = saml.promote_existing_legacy_for_space("S1", roles)
+
+    assert mappings[0]["spaceRolesMap"] == []
+    assert mappings[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpNRU1CRVI="]]
+    assert conversions == [("member", "Space Member")]
+    assert roles.calls == ["member"]
+
+
+def test_promote_existing_legacy_idempotent(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """A second call on the same space finds nothing to promote — no further mutation, no role lookup."""
+    mappings = [
+        {
+            "spaceRolesMap": [["S1", "admin"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "g1"]],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    roles = _FakeRolesForPromotion()
+
+    saml.promote_existing_legacy_for_space("S1", roles)
+    saml.promote_existing_legacy_for_space("S1", roles)  # second call
+
+    # spaceRbacRolesMap doesn't double up; spaceRolesMap stays empty.
+    assert mappings[0]["spaceRolesMap"] == []
+    assert mappings[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpBRE1JTg=="]]
+    # The role was looked up only once across the two calls (second pass had
+    # nothing to convert, so ensure_legacy_equivalent_role wasn't called).
+    assert roles.calls == ["admin"]
+
+
+def test_promote_existing_legacy_preserves_other_spaces(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Other spaces on the same mapping are not touched."""
+    mappings = [
+        {
+            "spaceRolesMap": [["S1", "member"], ["S2", "admin"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "g1"]],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    roles = _FakeRolesForPromotion()
+
+    saml.promote_existing_legacy_for_space("S1", roles)
+
+    assert mappings[0]["spaceRolesMap"] == [["S2", "admin"]]
+    assert mappings[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpNRU1CRVI="]]
+
+
+def test_promote_existing_legacy_across_multiple_mappings(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """The same space referenced from multiple mappings is fully converted."""
+    mappings = [
+        {
+            "spaceRolesMap": [["S1", "admin"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "admins"]],
+        },
+        {
+            "spaceRolesMap": [["S1", "member"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "members"]],
+        },
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    roles = _FakeRolesForPromotion()
+
+    conversions = saml.promote_existing_legacy_for_space("S1", roles)
+
+    assert mappings[0]["spaceRolesMap"] == []
+    assert mappings[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpBRE1JTg=="]]
+    assert mappings[1]["spaceRolesMap"] == []
+    assert mappings[1]["spaceRbacRolesMap"] == [["S1", "Um9sZTpNRU1CRVI="]]
+    # Returned conversions dedup keys across mappings.
+    assert set(conversions) == {("admin", "Space Admin"), ("member", "Space Member")}
+    assert sorted(roles.calls) == ["admin", "member"]
+
+
+def test_promote_existing_legacy_no_match_is_noop(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Promoting a space that's not in any existing mapping is a no-op."""
+    mappings = [
+        {
+            "spaceRolesMap": [["S2", "admin"]],
+            "spaceRbacRolesMap": [],
+            "attributesMap": [["groups", "g1"]],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    roles = _FakeRolesForPromotion()
+
+    conversions = saml.promote_existing_legacy_for_space("S1", roles)
+
+    assert conversions == []
+    assert roles.calls == []
+    # S2 untouched
+    assert mappings[0]["spaceRolesMap"] == [["S2", "admin"]]
+
+
+# ── reconcile_pending_into_existing ──────────────────────────────────────────
+
+
+def _capture_absorbed():
+    """Return (sink, callback) for assertions on absorbed events."""
+    sink: list[tuple[int, str, str, str, str]] = []
+
+    def _cb(row_number, kind, attr_name, attr_value, prior_role_label):
+        sink.append((row_number, kind, attr_name, attr_value, prior_role_label))
+
+    return sink, _cb
+
+
+def _make_pending(
+    row_number: int,
+    *,
+    space_id: str = "S1",
+    space_role: str = "",
+    space_rbac_role_id: str = "",
+    attr_name: str = "roles",
+    attr_value: str = "g1",
+    org_role: str = "member",
+    org_id: str = "O1",
+) -> PendingSAMLMapping:
+    return PendingSAMLMapping(
+        row_number=row_number,
+        org_id=org_id,
+        space_id=space_id,
+        org_role=org_role,
+        space_role=space_role,
+        space_rbac_role_id=space_rbac_role_id,
+        attr_name=attr_name,
+        attr_value=attr_value,
+    )
+
+
+def test_reconcile_idempotent_drops_pending_when_existing_has_same_rbac_role(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Case 2: existing has [S1, RoleX] in spaceRbacRolesMap; pending matches exactly."""
+    mappings = [
+        {
+            "attributesMap": [["roles", "engineers"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [["S1", "Um9sZTpNRU1CRVI="]],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    saml._pending = [
+        _make_pending(
+            row_number=1,
+            space_id="S1",
+            space_rbac_role_id="Um9sZTpNRU1CRVI=",
+            attr_value="engineers",
+        )
+    ]
+    sink, cb = _capture_absorbed()
+
+    saml.reconcile_pending_into_existing(on_absorbed=cb)
+
+    assert saml.pending == ()  # dropped
+    assert mappings[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpNRU1CRVI="]]
+    assert sink == [(1, "idempotent", "roles", "engineers", "")]
+
+
+def test_reconcile_replace_swaps_role_in_existing(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Case 3: existing has [S1, OldRole]; pending wants [S1, NewRole] (same map)."""
+    mappings = [
+        {
+            "attributesMap": [["roles", "leads"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [["S1", "Um9sZTpURVNUSU5H"]],  # Testing Custom Role
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    saml._pending = [
+        _make_pending(
+            row_number=2,
+            space_id="S1",
+            space_rbac_role_id="Um9sZTpBRE1JTg==",  # Space Admin
+            attr_value="leads",
+        )
+    ]
+    sink, cb = _capture_absorbed()
+
+    saml.reconcile_pending_into_existing(on_absorbed=cb)
+
+    assert saml.pending == ()
+    assert mappings[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpBRE1JTg=="]]
+    assert sink == [(2, "replaced", "roles", "leads", "Um9sZTpURVNUSU5H")]
+
+
+def test_reconcile_replace_handles_opposite_map(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Existing has [S1, legacy-role]; pending wants [S1, custom-role] → swap maps."""
+    mappings = [
+        {
+            "attributesMap": [["roles", "leads"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
+            "spaceRolesMap": [["S1", "admin"]],
+            "spaceRbacRolesMap": [],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    saml._pending = [
+        _make_pending(
+            row_number=3,
+            space_id="S1",
+            space_rbac_role_id="Um9sZTpBRE1JTg==",
+            attr_value="leads",
+        )
+    ]
+    sink, cb = _capture_absorbed()
+
+    saml.reconcile_pending_into_existing(on_absorbed=cb)
+
+    assert saml.pending == ()
+    assert mappings[0]["spaceRolesMap"] == []
+    assert mappings[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpBRE1JTg=="]]
+    assert sink == [(3, "replaced", "roles", "leads", "admin")]
+
+
+def test_reconcile_extended_appends_new_space_to_existing(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Case 4: existing has [S1, RoleX]; pending adds [S2, RoleY] under same attrs."""
+    mappings = [
+        {
+            "attributesMap": [["roles", "foo"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [["S1", "Um9sZTpNRU1CRVI="]],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    saml._pending = [
+        _make_pending(
+            row_number=4,
+            space_id="S2",
+            space_rbac_role_id="Um9sZTpBRE1JTg==",
+            attr_value="foo",
+        )
+    ]
+    sink, cb = _capture_absorbed()
+
+    saml.reconcile_pending_into_existing(on_absorbed=cb)
+
+    assert saml.pending == ()
+    assert mappings[0]["spaceRbacRolesMap"] == [
+        ["S1", "Um9sZTpNRU1CRVI="],
+        ["S2", "Um9sZTpBRE1JTg=="],
+    ]
+    assert sink == [(4, "extended", "roles", "foo", "")]
+
+
+def test_reconcile_inherited_pending_drops_when_existing_matches(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Case 5: pending with no role fields matches existing's (attr, val, org_role)."""
+    mappings = [
+        {
+            "attributesMap": [["roles", "all-users"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    saml._pending = [_make_pending(row_number=5, attr_value="all-users")]
+    sink, cb = _capture_absorbed()
+
+    saml.reconcile_pending_into_existing(on_absorbed=cb)
+
+    assert saml.pending == ()
+    assert sink == [(5, "inherited", "roles", "all-users", "")]
+
+
+def test_reconcile_no_match_keeps_pending(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Case 1: pending references an attribute pair the IdP doesn't have."""
+    mappings = [
+        {
+            "attributesMap": [["roles", "other"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [],
+        }
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    pending = _make_pending(
+        row_number=6, space_id="S1", space_rbac_role_id="Um9sZTpBRE1JTg==",
+        attr_value="new-group",
+    )
+    saml._pending = [pending]
+    sink, cb = _capture_absorbed()
+
+    saml.reconcile_pending_into_existing(on_absorbed=cb)
+
+    # Pending preserved, no callback fired
+    assert len(saml.pending) == 1
+    assert saml.pending[0] is pending
+    assert sink == []
+
+
+def test_reconcile_picks_first_match_when_multiple(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Defensive: if multiple existing mappings share (attr, val, org_role), use the first."""
+    mappings = [
+        {
+            "attributesMap": [["roles", "dup"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [["S1", "Um9sZTpNRU1CRVI="]],
+        },
+        {
+            "attributesMap": [["roles", "dup"]],
+            "orgRole": {"orgId": "O1", "roleId": "member"},
+            "spaceRolesMap": [],
+            "spaceRbacRolesMap": [["S1", "Um9sZTpBRE1JTg=="]],
+        },
+    ]
+    saml = _saml_with_existing(fake_executor, logger, mappings)
+    saml._pending = [
+        _make_pending(
+            row_number=7, space_id="S1",
+            space_rbac_role_id="Um9sZTpOWldX",
+            attr_value="dup",
+        )
+    ]
+    sink, cb = _capture_absorbed()
+
+    saml.reconcile_pending_into_existing(on_absorbed=cb)
+
+    # First mapping mutated; second untouched.
+    assert mappings[0]["spaceRbacRolesMap"] == [["S1", "Um9sZTpOWldX"]]
+    assert mappings[1]["spaceRbacRolesMap"] == [["S1", "Um9sZTpBRE1JTg=="]]
+    assert sink == [(7, "replaced", "roles", "dup", "Um9sZTpNRU1CRVI=")]
+
+
+# ── collapse_pending_by_attributes ───────────────────────────────────────────
+
+
+def test_collapse_groups_pending_with_same_attr_val_org_role(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """Three pending entries on the same (attr, val, org_role) collapse to one."""
+    saml = _saml_with_existing(fake_executor, logger, [])
+    saml._pending = [
+        _make_pending(
+            row_number=1, space_id="S1",
+            space_rbac_role_id="Um9sZTpB", attr_value="foo",
+        ),
+        _make_pending(
+            row_number=2, space_id="S2",
+            space_rbac_role_id="Um9sZTpC", attr_value="foo",
+        ),
+        _make_pending(
+            row_number=3, space_id="S3",
+            space_role="admin", attr_value="foo",
+        ),
+    ]
+    merged: list[tuple[int, int, str, str]] = []
+    saml.collapse_pending_by_attributes(
+        on_merged=lambda rn, owner, an, av: merged.append((rn, owner, an, av))
+    )
+
+    # One survivor (row 1), with extras for the other two.
+    assert len(saml.pending) == 1
+    owner = saml.pending[0]
+    assert owner.row_number == 1
+    assert owner.extra_space_rbac_pairs == [("S2", "Um9sZTpC")]
+    assert owner.extra_space_legacy_pairs == [("S3", "admin")]
+    assert merged == [
+        (2, 1, "roles", "foo"),
+        (3, 1, "roles", "foo"),
+    ]
+
+
+def test_collapse_leaves_distinct_attr_pairs_alone(
+    fake_executor, logger: logging.Logger
+) -> None:
+    saml = _saml_with_existing(fake_executor, logger, [])
+    saml._pending = [
+        _make_pending(row_number=1, attr_value="foo", space_rbac_role_id="R1"),
+        _make_pending(row_number=2, attr_value="bar", space_rbac_role_id="R2"),
+    ]
+    merged: list[tuple[int, int, str, str]] = []
+    saml.collapse_pending_by_attributes(
+        on_merged=lambda *_args: merged.append(_args)
+    )
+
+    assert len(saml.pending) == 2
+    assert merged == []
+
+
+# ── _build_new_mappings_input with extra pairs ───────────────────────────────
+
+
+def test_build_new_mappings_emits_extra_rbac_pairs(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """A pending with extra_space_rbac_pairs serializes to one entry with all pairs."""
+    saml = _saml_with_existing(fake_executor, logger, [])
+    owner = _make_pending(
+        row_number=1, space_id="S1",
+        space_rbac_role_id="R1", attr_value="foo",
+    )
+    owner.extra_space_rbac_pairs = [("S2", "R2")]
+    saml._pending = [owner]
+
+    entries = saml._build_new_mappings_input()
+
+    assert len(entries) == 1
+    assert entries[0]["spaceRbacRolesMap"] == [["S1", "R1"], ["S2", "R2"]]
+    assert "spaceRolesMap" not in entries[0]
+
+
+def test_build_new_mappings_emits_mixed_legacy_and_rbac_pairs(
+    fake_executor, logger: logging.Logger
+) -> None:
+    """An owner with both rbac primary + extra legacy emits both maps."""
+    saml = _saml_with_existing(fake_executor, logger, [])
+    owner = _make_pending(
+        row_number=1, space_id="S1",
+        space_rbac_role_id="R1", attr_value="foo",
+    )
+    owner.extra_space_legacy_pairs = [("S3", "admin")]
+    saml._pending = [owner]
+
+    entries = saml._build_new_mappings_input()
+
+    assert entries[0]["spaceRbacRolesMap"] == [["S1", "R1"]]
+    assert entries[0]["spaceRolesMap"] == [["S3", "admin"]]

@@ -1,39 +1,41 @@
 """Detect and resolve same-space mixed-role-type conflicts before the SAML flush.
 
 Arize allows only one role type (standard OR custom) per space across all SAML
-role mappings. Three distinct conflict shapes exist and need different handling:
+role mappings. Whenever the run produces a same-space legacy + custom conflict,
+this module promotes every legacy use on that space to a custom RBAC role
+mirroring its permission set. Custom is never demoted to legacy (the built-in
+legacy roles are fixed sets), so promotion is the only non-destructive way out.
 
-  1. **CSV-internal (all-pending)** — two CSV rows in this run target the same
-     space with mismatched role types. Instead of erroring, we auto-create
-     (or look up) a custom RBAC role mirroring the legacy role's permission
-     set, swap the pending legacy mapping(s) over to it, and let the run
-     continue. A non-error note is stamped on the converted rows so the user
-     can see what happened in the results CSV.
+Two conflict shapes exist — both involve a CSV row touching the space, since
+Arize's backend (and UI) prevents pre-existing mixed state on a space:
 
-  2. **CSV-vs-existing** — the CSV asks for one role type for a space the IdP
-     already has the other type for. That's migration intent; we strip just
-     that space's existing entries (in place on the SAML service's existing
-     mappings) so the new CSV row replaces them. Other entries on the
-     affected mappings (other spaces, attributes, orgRole) are preserved.
+  1. **CSV-internal** — two CSV rows in this run target the same space with
+     mismatched role types. The pending legacy row(s) are auto-converted to
+     the legacy-equivalent custom role and the run continues.
 
-  3. **already_exists + new-pending mismatch** — a CSV row matched an existing
-     IdP mapping exactly (already_exists, not queued) under one role type and
-     another CSV row queues a new mapping of the opposite type for the same
-     space. We can't silently mutate the existing entry, so this case still
-     errors with the original message.
+  2. **CSV-vs-existing** — the CSV touches a space (either a pending row or an
+     already_exists match) for which the IdP already holds the other role
+     type. Every legacy use on that space is promoted — pending rows AND any
+     pre-existing IdP entries. Matched rows keep status `already_exists` but
+     gain a note explaining the promotion. The existing custom-role mapping is
+     preserved.
 
-Example (CSV-internal, auto-converted):
+Example (CSV-internal):
     organization,space,arize_org_role,arize_space_role,...
     Acme,ML Platform,member,admin,...        ← builtin space role
     Acme,ML Platform,member,Reviewer,...     ← custom space role on the same space
     → "Space Admin" custom role is created (if absent), row 1 is swapped to it,
       both rows succeed.
 
-Example (CSV-vs-existing):
-    IdP already has: ML Platform under spaceRolesMap (builtin "admin")
-    CSV row:         Acme,ML Platform,member,Reviewer,...  ← custom role
-    → Migration: strip "ML Platform" from the existing spaceRolesMap entry,
-      let the CSV's custom-role mapping replace it.
+Example (CSV-vs-existing with matched row — the case behind this change):
+    IdP already has: NLP Research under spaceRolesMap (builtin "member") via
+                     attributes [["roles", "arize-nlp-research"]]
+    CSV row 6:       Acme,NLP Research,member,Testing Custom Roles,roles,arize-nlp-leads
+    CSV row 7:       Acme,NLP Research,member,member,roles,arize-nlp-research     ← matches existing
+    → "Space Member" custom role is created/looked up; the existing legacy
+      pair is moved from spaceRolesMap to spaceRbacRolesMap under the same
+      mapping. Row 6 ends up `created`/`dry_run`; row 7 stays `already_exists`
+      with a note about the promotion.
 """
 
 from __future__ import annotations
@@ -48,6 +50,12 @@ if TYPE_CHECKING:
     from .saml import SamlIdpService
 
 
+# Callback signature: (row_number, legacy_key, custom_name, kind)
+# kind is "pending" (the row's queued mapping was swapped) or "matched"
+# (the existing IdP mapping the row matched was promoted in place).
+OnLegacyConverted = Callable[[int, str, str, str], None]
+
+
 def resolve_role_type_conflicts(
     saml: "SamlIdpService",
     space_id_to_name: dict[str, str],
@@ -55,22 +63,25 @@ def resolve_role_type_conflicts(
     logger: logging.Logger,
     on_existed_to_error: Callable[[int], None],
     roles: "RolesCache | None" = None,
-    on_legacy_converted: Callable[[int, str, str], None] | None = None,
+    on_legacy_converted: OnLegacyConverted | None = None,
 ) -> None:
     """Resolve same-space mixed-role-type conflicts before the flush.
 
-    Mutates `results` in place (error rows get status + error_message set;
-    converted rows get a `note` set via `on_legacy_converted`) and may
-    mutate `saml.pending` entries (legacy → custom swap) or drop them
-    (preflight errors). CSV-vs-existing conflicts strip the space from the
-    existing IdP mappings.
+    For every conflicted `space_id` the CSV touches, promote all legacy uses
+    on that space to the legacy-equivalent custom role:
 
-    `on_existed_to_error(row_number)` is called once per row that flips from
-    `already_exists` → `error`, so the runner can decrement its counter.
+      - pending legacy rows are swapped via `saml.convert_legacy_to_custom`
+      - existing legacy IdP entries on the space are rewritten in place via
+        `saml.promote_existing_legacy_for_space`
+      - matched (already_exists) rows whose existing entry was promoted get
+        a non-error `note` (status stays `already_exists`)
 
-    `roles` + `on_legacy_converted` enable auto-conversion of legacy CSV rows
-    that conflict with a custom CSV row on the same space. When either is
-    None, falls back to the legacy error behavior.
+    Mutates `results` in place. May mutate `saml._pending` and
+    `saml._existing_mappings`.
+
+    `roles` + `on_legacy_converted` enable the promotion. When either is
+    `None`, or if the role lookup/creation raises, falls back to the original
+    error message so the run doesn't silently misbehave.
     """
     legacy_uses, rbac_uses = _collect_space_role_uses(saml)
     conflict_space_ids = set(legacy_uses) & set(rbac_uses)
@@ -80,60 +91,99 @@ def resolve_role_type_conflicts(
     row_to_user_role = {r.row_number: r.arize_space_role for r in results}
     pending_row_numbers = saml.pending_row_numbers()
 
+    can_promote = roles is not None and on_legacy_converted is not None
     row_errors: dict[int, str] = {}
+
     for space_id in conflict_space_ids:
         space_name = space_id_to_name.get(space_id, "<unknown>")
+        legacy_entries = legacy_uses[space_id]
+        rbac_entries = rbac_uses[space_id]
+
         pending_legacy_rows = sorted(
-            {row for row, _ in legacy_uses[space_id] if row is not None}
+            {
+                row
+                for row, _ in legacy_entries
+                if row is not None and row in pending_row_numbers
+            }
+        )
+        matched_legacy_rows = sorted(
+            {
+                row
+                for row, _ in legacy_entries
+                if row is not None and row not in pending_row_numbers
+            }
         )
         pending_rbac_rows = sorted(
-            {row for row, _ in rbac_uses[space_id] if row is not None}
+            {
+                row
+                for row, _ in rbac_entries
+                if row is not None and row in pending_row_numbers
+            }
         )
-        has_existing_legacy = any(
-            row is None for row, _ in legacy_uses[space_id]
+        matched_rbac_rows = sorted(
+            {
+                row
+                for row, _ in rbac_entries
+                if row is not None and row not in pending_row_numbers
+            }
         )
-        has_existing_rbac = any(row is None for row, _ in rbac_uses[space_id])
+        has_existing_legacy = any(row is None for row, _ in legacy_entries)
 
-        # Case 1: CSV-internal conflict. If every legacy row is truly pending
-        # (not an already_exists exact-match), auto-convert; otherwise fall
-        # through to the error path.
-        if pending_legacy_rows and pending_rbac_rows:
-            all_legacy_are_pending = (
-                set(pending_legacy_rows) <= pending_row_numbers
-            )
-            can_auto_convert = (
-                roles is not None
-                and on_legacy_converted is not None
-                and all_legacy_are_pending
-            )
-            if can_auto_convert:
-                _auto_convert_legacy_rows(
-                    saml=saml,
-                    space_id=space_id,
-                    space_name=space_name,
-                    legacy_rows=pending_legacy_rows,
-                    roles=roles,  # type: ignore[arg-type]
-                    on_legacy_converted=on_legacy_converted,  # type: ignore[arg-type]
-                    logger=logger,
-                )
-                continue
-            message = _build_csv_internal_message(
+        # Promote every legacy use to custom.
+        if not can_promote:
+            message = _build_conflict_message(
                 space_name,
                 pending_legacy_rows,
                 pending_rbac_rows,
+                matched_legacy_rows,
+                matched_rbac_rows,
                 row_to_user_role,
             )
-            for row in pending_legacy_rows + pending_rbac_rows:
+            for row in (
+                pending_legacy_rows
+                + pending_rbac_rows
+                + matched_legacy_rows
+                + matched_rbac_rows
+            ):
                 row_errors[row] = message
             continue
 
-        # Case 2: CSV-vs-existing conflict — migration. Strip in place.
-        if pending_legacy_rows and has_existing_rbac:
-            saml.strip_space(space_id, key="spaceRbacRolesMap")
-        elif pending_rbac_rows and has_existing_legacy:
-            saml.strip_space(space_id, key="spaceRolesMap")
-        # Else: only existing entries collide (no pending touches this space).
-        # Not the script's job to fix pre-existing IdP state.
+        try:
+            _promote_legacy_for_space(
+                saml=saml,
+                roles=roles,  # type: ignore[arg-type]
+                on_legacy_converted=on_legacy_converted,  # type: ignore[arg-type]
+                space_id=space_id,
+                space_name=space_name,
+                pending_legacy_rows=pending_legacy_rows,
+                matched_legacy_rows=matched_legacy_rows,
+                has_existing_legacy=has_existing_legacy,
+                logger=logger,
+            )
+        except Exception as exc:
+            # Role lookup/creation failed — fall back to the error path so the
+            # user sees a clear message rather than a half-converted IdP.
+            logger.error(
+                "Failed to auto-promote legacy roles for space '%s' (%s): %s",
+                space_name,
+                space_id,
+                exc,
+            )
+            message = _build_conflict_message(
+                space_name,
+                pending_legacy_rows,
+                pending_rbac_rows,
+                matched_legacy_rows,
+                matched_rbac_rows,
+                row_to_user_role,
+            )
+            for row in (
+                pending_legacy_rows
+                + pending_rbac_rows
+                + matched_legacy_rows
+                + matched_rbac_rows
+            ):
+                row_errors[row] = message
 
     if not row_errors:
         return
@@ -141,9 +191,6 @@ def resolve_role_type_conflicts(
     for r in results:
         if r.row_number not in row_errors:
             continue
-        # If the row had previously been marked already_exists, the counter
-        # was bumped optimistically; let the caller back it out so the
-        # summary reflects the final error status.
         if r.status == "already_exists":
             on_existed_to_error(r.row_number)
         r.status = "error"
@@ -153,32 +200,37 @@ def resolve_role_type_conflicts(
     saml.drop_pending(set(row_errors.keys()))
 
 
-def _auto_convert_legacy_rows(
+def _promote_legacy_for_space(
     *,
     saml: "SamlIdpService",
+    roles: "RolesCache",
+    on_legacy_converted: OnLegacyConverted,
     space_id: str,
     space_name: str,
-    legacy_rows: list[int],
-    roles: "RolesCache",
-    on_legacy_converted: Callable[[int, str, str], None],
+    pending_legacy_rows: list[int],
+    matched_legacy_rows: list[int],
+    has_existing_legacy: bool,
     logger: logging.Logger,
 ) -> None:
-    """Convert each pending legacy mapping for `space_id` to its custom equivalent.
+    """Promote every legacy use on `space_id` to its custom equivalent.
 
-    Idempotent — `RolesCache.ensure_legacy_equivalent_role` looks up the cached
-    role first and only POSTs /v2/roles when the equivalent doesn't yet exist.
+    Sources:
+      - pending CSV rows queued under spaceRolesMap → swapped via convert_legacy_to_custom
+      - existing IdP entries on the space (matched or not) → rewritten via
+        promote_existing_legacy_for_space
+      - matched rows are annotated via on_legacy_converted(kind="matched")
     """
-    for row in legacy_rows:
+    # 1. Convert pending legacy rows in `_pending`.
+    for row in pending_legacy_rows:
         outcome = saml.convert_legacy_to_custom(row, space_id, roles)
         if outcome is None:
-            # Defensive: caller already verified rows are pending. Treat any
-            # gap as a logical error so we don't silently drop the row's intent.
+            # Defensive: caller filtered for pending; treat as bug.
             raise RuntimeError(
                 f"Row {row}: expected a pending legacy mapping for space "
                 f"'{space_name}' ({space_id}) but found none."
             )
         legacy_key, custom_name = outcome
-        on_legacy_converted(row, legacy_key, custom_name)
+        on_legacy_converted(row, legacy_key, custom_name, "pending")
         logger.info(
             "Row %d: auto-converted legacy '%s' → custom role '%s' "
             "(space '%s' uses a custom role in another mapping)",
@@ -187,6 +239,32 @@ def _auto_convert_legacy_rows(
             custom_name,
             space_name,
         )
+
+    # 2. Promote existing IdP legacy entries for this space (matched or orphan).
+    #    Skip if no existing legacy on the space — promote is a no-op anyway,
+    #    but skipping keeps the log clean.
+    if has_existing_legacy:
+        conversions = saml.promote_existing_legacy_for_space(space_id, roles)
+        for legacy_key, custom_name in conversions:
+            logger.info(
+                "Auto-promoted existing legacy '%s' → custom role '%s' on "
+                "space '%s' (another mapping uses a custom role)",
+                legacy_key,
+                custom_name,
+                space_name,
+            )
+
+        # 3. Annotate every matched row whose underlying entry just got promoted.
+        #    The mapping was preserved (just under a different role type), so
+        #    the row's status stays `already_exists`.
+        if conversions and matched_legacy_rows:
+            # Pick a representative (legacy_key, custom_name) per matched row.
+            # In the typical case there's one legacy key on the space; if
+            # multiple, the first conversion is a reasonable summary for the
+            # note. The full breakdown shows up in the log above.
+            rep_key, rep_name = conversions[0]
+            for row in matched_legacy_rows:
+                on_legacy_converted(row, rep_key, rep_name, "matched")
 
 
 def _collect_space_role_uses(
@@ -198,7 +276,8 @@ def _collect_space_role_uses(
     """For every space_id, list who's using it under each role-type.
 
     Entry tuple is (csv_row_number_or_None, label). row_number is None for
-    an existing IdP mapping; integer for a CSV row (pending or already_exists).
+    an existing IdP mapping that no CSV row matched; integer for a CSV row
+    (pending or already_exists).
     """
     legacy_uses: dict[str, list[tuple[int | None, str]]] = {}
     rbac_uses: dict[str, list[tuple[int | None, str]]] = {}
@@ -215,9 +294,7 @@ def _collect_space_role_uses(
         if p.space_rbac_role_id:
             rbac_uses.setdefault(p.space_id, []).append((p.row_number, "custom"))
         elif p.space_role:
-            legacy_uses.setdefault(p.space_id, []).append(
-                (p.row_number, "standard")
-            )
+            legacy_uses.setdefault(p.space_id, []).append((p.row_number, "standard"))
 
     # Exact-match (already_exists) rows also express the CSV's intent for a
     # space's role-type. Include them so the preflight can detect a CSV that
@@ -231,23 +308,30 @@ def _collect_space_role_uses(
     return legacy_uses, rbac_uses
 
 
-def _build_csv_internal_message(
+def _build_conflict_message(
     space_name: str,
     pending_legacy_rows: list[int],
     pending_rbac_rows: list[int],
+    matched_legacy_rows: list[int],
+    matched_rbac_rows: list[int],
     row_to_user_role: dict[int, str],
 ) -> str:
+    """Compose the fallback error message used when auto-promotion is unavailable."""
+
     def describe(rows: list[int]) -> str:
-        return ", ".join(
-            f"row {r} ('{row_to_user_role.get(r, '')}')" for r in rows
+        return (
+            ", ".join(f"row {r} ('{row_to_user_role.get(r, '')}')" for r in rows)
+            or "(none)"
         )
 
     return (
         f"Space '{space_name}' would receive both a standard role and "
-        f"a custom role from your CSV, which Arize does not allow. "
+        f"a custom role across SAML mappings, which Arize does not allow. "
         f"Each space must use only one role type. Conflicts: "
-        f"standard role in {describe(pending_legacy_rows)}; "
-        f"custom role in {describe(pending_rbac_rows)}. "
+        f"standard role in {describe(pending_legacy_rows + matched_legacy_rows)}; "
+        f"custom role in {describe(pending_rbac_rows + matched_rbac_rows)}. "
+        f"Auto-promotion to a custom role mirroring the legacy permissions "
+        f"is unavailable (RolesCache not provided or POST /v2/roles failed). "
         f"Please edit the CSV so this space uses either standard roles "
         f"(admin/member/viewer/annotator) or a custom role — not both."
     )

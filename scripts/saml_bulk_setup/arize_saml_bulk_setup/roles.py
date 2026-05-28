@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 
-from .config import ARIZE_REST_API_URL
+from .config import ARIZE_REST_API_URL, RELAY_ROLE_ID_PREFIX
 from .legacy_role_permissions import LEGACY_ROLE_EQUIVALENTS
 from .retry import with_retry
 
@@ -28,6 +28,14 @@ class RolesCache:
         self._role_ids: set[str] = set()
         self._loaded = False
 
+    def id_to_name(self, role_id: str) -> str:
+        """Return the human-readable name for a relay role ID, or the ID itself if unknown."""
+        self._ensure_loaded()
+        for name, rid in self._name_to_id.items():
+            if rid == role_id:
+                return name
+        return role_id
+
     def resolve_custom_space_role(self, role_value: str) -> str:
         """Resolve a non-builtin space role to a relay role ID.
 
@@ -35,8 +43,7 @@ class RolesCache:
         global ID (validated against the cache).
         """
         self._ensure_loaded()
-        # Relay role IDs are base64 of "Role:<int>" → all start with "Um9sZTo".
-        if role_value.startswith("Um9sZTo") and role_value in self._role_ids:
+        if role_value.startswith(RELAY_ROLE_ID_PREFIX) and role_value in self._role_ids:
             return role_value
         rid = self._name_to_id.get(role_value.lower())
         if rid:
