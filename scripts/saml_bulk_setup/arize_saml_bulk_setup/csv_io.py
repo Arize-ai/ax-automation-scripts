@@ -6,7 +6,7 @@ import csv
 import os
 import sys
 
-from .config import OUTPUT_COLUMNS, REQUIRED_COLUMNS
+from .config import OUTPUT_COLUMNS, OUTPUT_COLUMNS_WITH_PROJECTS, REQUIRED_COLUMNS
 from .models import RowResult
 
 
@@ -41,22 +41,33 @@ def load_csv(path: str) -> list[dict[str, str]]:
     return rows
 
 
-def write_results_csv(results: list[RowResult], output_path: str) -> None:
-    """Write one CSV row per RowResult to `output_path`, columns per OUTPUT_COLUMNS."""
+def write_results_csv(
+    results: list[RowResult],
+    output_path: str,
+    with_projects: bool = False,
+) -> None:
+    """Write one CSV row per RowResult to `output_path`.
+
+    When `with_projects` is True the output includes the `project` and
+    `project_emails` columns (from OUTPUT_COLUMNS_WITH_PROJECTS).
+    """
+    columns = OUTPUT_COLUMNS_WITH_PROJECTS if with_projects else OUTPUT_COLUMNS
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         for r in results:
-            writer.writerow(
-                {
-                    "organization": r.organization,
-                    "space": r.space,
-                    "arize_org_role": r.arize_org_role,
-                    "arize_space_role": r.arize_space_role,
-                    "saml_attribute_name": r.saml_attribute_name,
-                    "saml_attribute_value": r.saml_attribute_value,
-                    "status": r.status,
-                    "error_message": r.error_message,
-                    "note": r.note,
-                }
-            )
+            row: dict[str, str] = {
+                "organization": r.organization,
+                "space": r.space,
+                "arize_org_role": r.arize_org_role,
+                "arize_space_role": r.arize_space_role,
+                "saml_attribute_name": r.saml_attribute_name,
+                "saml_attribute_value": r.saml_attribute_value,
+                "status": r.status,
+                "error_message": r.error_message,
+                "note": r.note,
+            }
+            if with_projects:
+                row["project"] = r.project
+                row["project_emails"] = r.project_emails
+            writer.writerow(row)

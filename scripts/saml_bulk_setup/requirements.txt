@@ -5,6 +5,9 @@
 # Org/space CRUD goes through the REST API (see arize_saml_bulk_setup/orgs_spaces.py).
 arize-toolkit>=0.1.0
 
+# Arize SDK
+arize>=8.0.0
+
 # GraphQL client used by the toolkit for the three remaining SAML ops
 # (getSAMLIdP, createSAMLIdP, updateSAMLIdP).
 gql[requests]>=3.0.0,<4.0

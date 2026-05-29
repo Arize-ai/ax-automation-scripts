@@ -37,6 +37,16 @@ def print_summary(
             f"  Auto-converts : {runner.legacy_auto_conversions} legacy role(s) "
             "converted to custom equivalents for cross-mapping compatibility"
         )
+    if runner.project_assign:
+        print(
+            f"  Projects      : {runner.projects_created} created, {runner.projects_existed} already existed"
+        )
+        if runner.users_created_for_project:
+            print(f"  Users created : {runner.users_created_for_project} (for project assignment)")
+        print(
+            f"  Proj access   : {runner.project_assignments_created} granted, "
+            f"{runner.project_assignments_existed} already had access"
+        )
     if errors:
         print(f"  Errors        : {len(errors)} row(s) failed — review {output_path}")
     else:

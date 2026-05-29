@@ -13,6 +13,8 @@ class RowResult:
     `error_message` is non-empty only when `status == "error"`.
     `note` is a non-error advisory (e.g. legacy→custom auto-conversion) shown
     in the results CSV alongside non-error statuses.
+    `project` and `project_emails` are populated from the CSV when
+    --project-assign is active; both default to "" when the flag is off.
     """
 
     row_number: int
@@ -25,6 +27,8 @@ class RowResult:
     status: str = ""
     error_message: str = ""
     note: str = ""
+    project: str = ""
+    project_emails: str = ""
 
 
 @dataclass

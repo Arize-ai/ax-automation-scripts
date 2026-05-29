@@ -111,7 +111,7 @@ class OrgSpaceService:
 
         try:
             org = self._post("/v2/organizations", {"name": org_name})
-        except Exception as exc:
+        except requests.RequestException as exc:
             self._org_create_failures[org_name] = str(exc)
             raise
         self._org_cache[org["name"]] = org["id"]
@@ -150,7 +150,7 @@ class OrgSpaceService:
                 "/v2/spaces",
                 {"name": space_name, "organization_id": org_id},
             )
-        except Exception as exc:
+        except requests.RequestException as exc:
             self._space_create_failures[cache_key] = str(exc)
             raise
         self._space_cache[(org_id, space["name"])] = space["id"]

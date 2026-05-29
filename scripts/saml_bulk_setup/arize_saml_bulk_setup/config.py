@@ -41,3 +41,27 @@ OUTPUT_COLUMNS: list[str] = [
     "error_message",
     "note",
 ]
+
+# Project-assignment feature (--project-assign flag).
+# These columns are optional in the CSV; only read when the flag is active.
+PROJECT_COLUMNS: tuple[str, ...] = ("project", "project_emails")
+
+# When --project-assign is set, the output CSV includes two extra columns.
+OUTPUT_COLUMNS_WITH_PROJECTS: list[str] = [
+    "organization",
+    "space",
+    "arize_org_role",
+    "arize_space_role",
+    "saml_attribute_name",
+    "saml_attribute_value",
+    "project",
+    "project_emails",
+    "status",
+    "error_message",
+    "note",
+]
+
+# invite_mode=none: creates a user with SSO-only access and no email invite.
+# Role bindings require an existing user_id, so users that haven't logged in
+# via SAML yet must be pre-created this way.
+PROJECT_INVITE_MODE = "none"

@@ -35,6 +35,8 @@ def with_retry(
     for attempt in range(MAX_RETRIES):
         try:
             return fn()
+        # Intentionally broad: gql and requests raise different types for 429s;
+        # we only retry when _is_rate_limit_error matches.
         except Exception as exc:
             if _is_rate_limit_error(exc) and attempt < MAX_RETRIES - 1:
                 wait = INITIAL_BACKOFF * (2**attempt)

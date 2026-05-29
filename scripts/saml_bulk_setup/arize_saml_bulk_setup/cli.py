@@ -48,6 +48,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Arize app base URL (default: {ARIZE_APP_URL})",
     )
 
+    project_group = parser.add_argument_group(
+        "Project assignment (opt-in; requires 'project' and 'project_emails' columns in CSV)"
+    )
+    project_group.add_argument(
+        "--project-assign",
+        action="store_true",
+        help=(
+            "Create/restrict projects and assign users from the 'project' and "
+            "'project_emails' CSV columns. 'arize_space_role' must be one of: "
+            "project_admin, project_editor, project_viewer on rows with a project."
+        ),
+    )
+
     saml_group = parser.add_argument_group(
         "SAML IdP creation (only needed if no IdP is configured yet)"
     )
@@ -139,11 +152,12 @@ def main() -> None:
         enforce_saml=args.enforce_saml,
         sync_user_roles=args.sync_user_roles,
         sign_authn=args.sign_authn,
+        project_assign=args.project_assign,
     )
 
     results = runner.run(rows)
 
-    write_results_csv(results, args.output)
+    write_results_csv(results, args.output, with_projects=args.project_assign)
     print_summary(runner, results, args.output)
 
     sys.exit(1 if any(r.status == "error" for r in results) else 0)

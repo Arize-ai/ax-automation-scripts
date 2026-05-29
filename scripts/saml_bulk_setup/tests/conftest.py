@@ -28,7 +28,7 @@ def fixtures_dir() -> Path:
 
 
 @pytest.fixture
-def sample_row() -> dict:
+def sample_row() -> dict[str, str]:
     """A minimal valid CSV row."""
     return {
         "organization": "Acme Corp",

@@ -148,11 +148,12 @@ def resolve_role_type_conflicts(
                 row_errors[row] = message
             continue
 
+        assert roles is not None and on_legacy_converted is not None
         try:
             _promote_legacy_for_space(
                 saml=saml,
-                roles=roles,  # type: ignore[arg-type]
-                on_legacy_converted=on_legacy_converted,  # type: ignore[arg-type]
+                roles=roles,
+                on_legacy_converted=on_legacy_converted,
                 space_id=space_id,
                 space_name=space_name,
                 pending_legacy_rows=pending_legacy_rows,
@@ -160,14 +161,13 @@ def resolve_role_type_conflicts(
                 has_existing_legacy=has_existing_legacy,
                 logger=logger,
             )
-        except Exception as exc:
+        except Exception:
             # Role lookup/creation failed — fall back to the error path so the
             # user sees a clear message rather than a half-converted IdP.
-            logger.error(
-                "Failed to auto-promote legacy roles for space '%s' (%s): %s",
+            logger.exception(
+                "Failed to auto-promote legacy roles for space '%s' (%s)",
                 space_name,
                 space_id,
-                exc,
             )
             message = _build_conflict_message(
                 space_name,

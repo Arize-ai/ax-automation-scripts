@@ -9,6 +9,7 @@ from .config import ARIZE_APP_URL, RELAY_ROLE_ID_PREFIX, ROLE_ALIAS, VALID_ORG_R
 from .models import PendingSAMLMapping, RowResult
 from .orgs_spaces import OrgSpaceService
 from .preflight import resolve_role_type_conflicts
+from .projects import ProjectService
 from .roles import RolesCache
 from .saml import SamlIdpService
 
@@ -33,8 +34,10 @@ class BulkSetupRunner:
         enforce_saml: bool | None = None,
         sync_user_roles: bool | None = None,
         sign_authn: bool | None = None,
+        project_assign: bool = False,
     ) -> None:
         self.dry_run = dry_run
+        self.project_assign = project_assign
         self.logger = self._build_logger(verbose)
 
         self.orgs_spaces = OrgSpaceService(
@@ -55,6 +58,12 @@ class BulkSetupRunner:
             sync_user_roles=sync_user_roles,
             sign_authn=sign_authn,
         )
+        if project_assign:
+            self.project_svc = ProjectService(
+                api_key=api_key,
+                logger=self.logger,
+                dry_run=dry_run,
+            )
 
         self._init_counters()
 
@@ -86,8 +95,14 @@ class BulkSetupRunner:
         self.mappings_created = 0
         self.mappings_existed = 0
         self.legacy_auto_conversions = 0
+        self.projects_created = 0
+        self.projects_existed = 0
+        self.users_created_for_project = 0
+        self.project_assignments_created = 0
+        self.project_assignments_existed = 0
         self._counted_orgs: set[str] = set()
         self._counted_spaces: set[str] = set()
+        self._counted_projects: set[str] = set()
 
     # ── Row processor ─────────────────────────────────────────────────────────
 
@@ -107,6 +122,19 @@ class BulkSetupRunner:
         attr_name = (row.get("saml_attribute_name") or "").strip()
         attr_value = (row.get("saml_attribute_value") or "").strip()
 
+        project_name = (row.get("project") or "").strip()
+        project_emails = (row.get("project_emails") or "").strip()
+
+        # A project-only row has project columns set but SAML attribute columns
+        # empty — the SAML phase is skipped entirely. Useful when the SAML
+        # mapping already exists and only project creation + user assignment is needed.
+        is_project_only = (
+            self.project_assign
+            and bool(project_name)
+            and not attr_name
+            and not attr_value
+        )
+
         result = RowResult(
             row_number=row_number,
             organization=org_name,
@@ -115,67 +143,90 @@ class BulkSetupRunner:
             arize_space_role=arize_space_role_raw,
             saml_attribute_name=attr_name,
             saml_attribute_value=attr_value,
+            project=project_name,
+            project_emails=project_emails,
         )
 
-        validation_error = _validate_row(
-            org_name,
-            space_name,
-            arize_org_role,
-            arize_space_role_raw,
-            attr_name,
-            attr_value,
-        )
+        if is_project_only:
+            validation_error = _validate_project_only_row(org_name, space_name, arize_space_role_raw)
+        else:
+            validation_error = _validate_row(
+                org_name,
+                space_name,
+                arize_org_role,
+                arize_space_role_raw,
+                attr_name,
+                attr_value,
+            )
         if validation_error:
             result.status = "error"
             result.error_message = validation_error
             return result
 
-        org_role = ROLE_ALIAS[arize_org_role]
         space_role, is_custom_space_role = _classify_space_role(arize_space_role_raw)
 
         try:
             org_id = self._resolve_org(org_name, row_number)
             space_id = self._resolve_space(org_id, org_name, space_name, row_number)
 
-            # SAML is loaded by run()'s pre-flight before any row reaches here.
+            if is_project_only:
+                # No SAML mapping — status reflects the project phase outcome.
+                result.status = "dry_run" if self.dry_run else "created"
+            else:
+                org_role = ROLE_ALIAS[arize_org_role]
 
-            # Resolve a custom RBAC role (if any) to its relay global ID.
-            space_rbac_role_id = ""
-            if is_custom_space_role:
-                try:
-                    space_rbac_role_id = self.roles.resolve_custom_space_role(
-                        arize_space_role_raw
-                    )
-                except ValueError as exc:
-                    if not self.dry_run:
-                        raise
-                    # Dry-run: warn but don't fail the row. Skip queuing the
-                    # mapping since we don't have a relay ID, and let the
-                    # operator fix the CSV (or create the role) before rerunning.
-                    self.logger.warning("Row %d: %s", row_number, exc)
-                    result.status = "dry_run"
-                    result.note = (
-                        f"Custom role '{arize_space_role_raw}' does not exist on "
-                        "this account — this row would fail in a real run. "
-                        "Create the role in the Arize UI or fix the CSV name, "
-                        "then rerun."
-                    )
-                    return result
+                # SAML is loaded by run()'s pre-flight before any row reaches here.
 
-            self._process_saml_mapping(
-                result=result,
-                row_number=row_number,
-                org_id=org_id,
-                space_id=space_id,
-                space_name=space_name,
-                arize_org_role=arize_org_role,
-                arize_space_role_raw=arize_space_role_raw,
-                org_role=org_role,
-                space_role=space_role,
-                space_rbac_role_id=space_rbac_role_id,
-                attr_name=attr_name,
-                attr_value=attr_value,
-            )
+                # Resolve a custom RBAC role (if any) to its relay global ID.
+                space_rbac_role_id = ""
+                if is_custom_space_role:
+                    try:
+                        space_rbac_role_id = self.roles.resolve_custom_space_role(
+                            arize_space_role_raw
+                        )
+                    except ValueError as exc:
+                        if not self.dry_run:
+                            raise
+                        # Dry-run: warn but don't fail the row. Skip queuing the
+                        # mapping since we don't have a relay ID, and let the
+                        # operator fix the CSV (or create the role) before rerunning.
+                        self.logger.warning("Row %d: %s", row_number, exc)
+                        result.status = "dry_run"
+                        result.note = (
+                            f"Custom role '{arize_space_role_raw}' does not exist on "
+                            "this account — this row would fail in a real run. "
+                            "Create the role in the Arize UI or fix the CSV name, "
+                            "then rerun."
+                        )
+                        return result
+
+                self._process_saml_mapping(
+                    result=result,
+                    row_number=row_number,
+                    org_id=org_id,
+                    space_id=space_id,
+                    space_name=space_name,
+                    arize_org_role=arize_org_role,
+                    arize_space_role_raw=arize_space_role_raw,
+                    org_role=org_role,
+                    space_role=space_role,
+                    space_rbac_role_id=space_rbac_role_id,
+                    attr_name=attr_name,
+                    attr_value=attr_value,
+                )
+
+            if self.project_assign and project_name:
+                self._process_project_assignment(
+                    result=result,
+                    row_number=row_number,
+                    space_id=space_id,
+                    space_name=space_name,
+                    org_name=org_name,
+                    arize_org_role=arize_org_role or "member",
+                    arize_space_role_raw=arize_space_role_raw,
+                    project_name=project_name,
+                    project_emails=project_emails,
+                )
 
         except Exception as exc:
             result.status = "error"
@@ -302,6 +353,103 @@ class BulkSetupRunner:
                 attr_value=attr_value,
             )
         )
+
+    def _process_project_assignment(
+        self,
+        *,
+        result: RowResult,
+        row_number: int,
+        space_id: str,
+        space_name: str,
+        org_name: str,
+        arize_org_role: str,
+        arize_space_role_raw: str,
+        project_name: str,
+        project_emails: str,
+    ) -> None:
+        """Create/find the project, restrict it, and assign all listed emails."""
+        project_role = arize_space_role_raw.lower()
+
+        # Validate emails present.
+        emails = [e.strip() for e in project_emails.split(",") if e.strip()]
+        if not emails:
+            result.status = "error"
+            result.error_message = (
+                "project_emails is required and must contain at least one email "
+                "when 'project' is set"
+            )
+            return
+
+        label = f"{org_name}/{space_name}/{project_name}"
+
+        try:
+            # Resolve project role relay ID.
+            # Legacy space roles (admin, member, viewer, annotator) don't have relay
+            # IDs in GET /v2/roles, so map them to their auto-created custom RBAC
+            # equivalents (Space Admin, Space Member, Space Read-Only, Space Annotator).
+            if project_role in ROLE_ALIAS:
+                role_id, _ = self.roles.ensure_legacy_equivalent_role(ROLE_ALIAS[project_role])
+            else:
+                role_id = self.roles.resolve_custom_space_role(arize_space_role_raw)
+
+            # Create/find project.
+            project_id, proj_status = self.project_svc.resolve_project(
+                space_id, space_name, project_name
+            )
+            if project_id not in self._counted_projects:
+                self._counted_projects.add(project_id)
+                if proj_status in ("created", "dry_run"):
+                    self.projects_created += 1
+                elif proj_status == "already_exists":
+                    self.projects_existed += 1
+            self.logger.debug(
+                "Row %d: project '%s' — %s (%s)", row_number, project_name, proj_status, project_id
+            )
+
+            # Restrict project.
+            restrict_status = self.project_svc.restrict_project(project_id, label)
+            self.logger.debug("Row %d: restrict %s — %s", row_number, label, restrict_status)
+
+            # Assign each email.
+            assigned, already, created_users = 0, 0, 0
+            for email in emails:
+                user_id, user_status = self.project_svc.resolve_user(email, arize_org_role)
+                if user_status in ("created", "dry_run"):
+                    created_users += 1
+                    self.users_created_for_project += 1
+
+                binding_status = self.project_svc.assign_user_to_project(
+                    user_id, project_id, role_id, project_name=project_name
+                )
+                if binding_status in ("granted", "dry_run"):
+                    assigned += 1
+                elif binding_status == "already_granted":
+                    already += 1
+
+            self.project_assignments_created += assigned
+            self.project_assignments_existed += already
+
+            note_parts = [f"project '{project_name}': {restrict_status}"]
+            if assigned:
+                note_parts.append(f"{assigned} user(s) assigned ({project_role})")
+            if already:
+                note_parts.append(f"{already} already had access")
+            project_note = "; ".join(note_parts)
+
+            if result.note:
+                result.note = f"{result.note} | {project_note}"
+            else:
+                result.note = project_note
+
+        except Exception as exc:
+            result.status = "error"
+            result.error_message = str(exc)
+            self.logger.error(
+                "Row %d project phase failed: %s",
+                row_number,
+                exc,
+                exc_info=self.logger.isEnabledFor(logging.DEBUG),
+            )
 
     # ── Top-level run ─────────────────────────────────────────────────────────
 
@@ -515,6 +663,8 @@ class BulkSetupRunner:
             arize_space_role=(row.get("arize_space_role") or "").strip(),
             saml_attribute_name=(row.get("saml_attribute_name") or "").strip(),
             saml_attribute_value=(row.get("saml_attribute_value") or "").strip(),
+            project=(row.get("project") or "").strip(),
+            project_emails=(row.get("project_emails") or "").strip(),
             status="error",
             error_message=error_message,
         )
@@ -568,6 +718,27 @@ def _validate_row(
             "Org admins receive full org access; leave arize_space_role blank."
         )
 
+    return ""
+
+
+def _validate_project_only_row(
+    org_name: str, space_name: str, arize_space_role_raw: str
+) -> str:
+    """Validate a project-only row (SAML columns intentionally empty).
+
+    Only organization, space, and arize_space_role are required.
+    """
+    missing = [
+        col
+        for col, val in [
+            ("organization", org_name),
+            ("space", space_name),
+            ("arize_space_role", arize_space_role_raw),
+        ]
+        if not val
+    ]
+    if missing:
+        return f"Missing required field(s): {', '.join(missing)}"
     return ""
 
 
