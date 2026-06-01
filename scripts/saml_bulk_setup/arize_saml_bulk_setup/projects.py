@@ -65,9 +65,10 @@ class ProjectService:
             return self._project_cache[cache_key], "already_exists"
 
         if self._dry_run:
-            self._project_cache[cache_key] = project_name
+            fake_id = f"__dry_run_project_{space_id}_{project_name}__"
+            self._project_cache[cache_key] = fake_id
             self._logger.info("[DRY RUN] Would create project: %s", project_name)
-            return project_name, "dry_run"
+            return fake_id, "dry_run"
 
         self._logger.info(
             "Creating project '%s' in space '%s'…", project_name, space_name
