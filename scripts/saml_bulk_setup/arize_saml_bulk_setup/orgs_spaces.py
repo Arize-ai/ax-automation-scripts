@@ -140,7 +140,7 @@ class OrgSpaceService:
 
         self._logger.info("Creating space '%s' in org '%s'…", space_name, org_name)
         if self._dry_run:
-            fake_id = f"__dry_run_space_{space_name}__"
+            fake_id = f"__dry_run_space_{org_id}_{space_name}__"
             self._space_cache[cache_key] = fake_id
             self._logger.info("[DRY RUN] Would create space: %s", space_name)
             return fake_id, "dry_run"
