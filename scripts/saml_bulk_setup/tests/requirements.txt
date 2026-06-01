@@ -2,3 +2,4 @@
 # Install with: pip install -r tests/requirements.txt
 
 pytest>=8.0,<9
+responses>=0.24
