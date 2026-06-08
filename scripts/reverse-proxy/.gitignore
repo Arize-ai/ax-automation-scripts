@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+certs/
+.env
+.env.*
+!.env.example
+
+# Captured request dumps (DUMP_REQUESTS_FILE) -- may contain sensitive data
+captured*.jsonl
