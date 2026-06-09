@@ -1,0 +1,5 @@
+# Test-time dependencies (not needed to run arize_saml_bulk_setup.py).
+# Install with: pip install -r tests/requirements.txt
+
+pytest>=8.0,<9
+responses>=0.24

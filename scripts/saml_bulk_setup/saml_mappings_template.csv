@@ -1,7 +1,12 @@
-organization,space,arize_org_role,arize_space_role,saml_attribute_name,saml_attribute_value
-Acme Corp,ML Platform,admin,,groups,arize-admins
-Acme Corp,ML Platform,member,admin,groups,arize-ml-engineers
-Acme Corp,Fraud Detection,member,,groups,arize-fraud-team
-Acme Corp,Fraud Detection,viewer,member,groups,arize-risk-analysts
-Subsidiary Inc,NLP Research,member,admin,groups,arize-nlp-leads
-Subsidiary Inc,NLP Research,member,,groups,arize-nlp-engineers
+organization,space,arize_org_role,arize_space_role,saml_attribute_name,saml_attribute_value,project,project_emails
+Acme Corp,ML Platform,admin,,roles,admins,,
+Acme Corp,ML Platform,member,admin,roles,arize-ml-engineers,,
+Acme Corp,ML Platform,viewer,viewer,roles,basic-viewer,,
+Acme Corp,Fraud Detection,member,,roles,arize-fraud-team,,
+Acme Corp,Fraud Detection,viewer,member,roles,arize-risk-analysts,,
+Subsidiary Inc,NLP Research,member,admin,roles,arize-nlp-leads,,
+Subsidiary Inc,Agents,member,custom_role_name,roles,arize-nlp-leads,,
+Acme Corp,ML Platform,member,project_admin,roles,arize-risk-leads,Credit Risk,"alice@arize.com,bob@arize.com"
+Acme Corp,ML Platform,member,project_viewer,roles,arize-risk-viewers,Credit Risk,carol@arize.com
+Acme Corp,ML Platform,,project_viewer,,,Insurance Risk,pete@arize.com
+Subsidiary Inc,NLP Research,member,member,roles,arize-nlp-engineers,Chatbot QA,"john@arize.com,sarah@arize.com"

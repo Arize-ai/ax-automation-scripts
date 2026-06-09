@@ -1,0 +1,2 @@
+organization,space,arize_org_role,arize_space_role,saml_attribute_name,saml_attribute_value
+Acme Corp,ML Platform,member,admin,groups,arize-ml-engineers

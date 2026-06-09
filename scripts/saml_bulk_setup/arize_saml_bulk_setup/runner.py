@@ -1,0 +1,758 @@
+"""Orchestrator: wires the services together and processes CSV rows."""
+
+from __future__ import annotations
+
+import logging
+import sys
+
+from .config import ARIZE_APP_URL, RELAY_ROLE_ID_PREFIX, ROLE_ALIAS, VALID_ORG_ROLES
+from .models import PendingSAMLMapping, RowResult
+from .orgs_spaces import OrgSpaceService
+from .preflight import resolve_role_type_conflicts
+from .projects import ProjectService
+from .roles import RolesCache
+from .saml import SamlIdpService
+
+
+class BulkSetupRunner:
+    """End-to-end orchestrator for one CSV invocation.
+
+    Owns a logger + run counters and composes three services (orgs/spaces,
+    roles, SAML). `run(rows)` processes each row through `process_row`,
+    runs the preflight conflict resolver, then flushes queued SAML mappings.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        dry_run: bool,
+        verbose: bool,
+        arize_app_url: str = ARIZE_APP_URL,
+        saml_metadata_url: str | None = None,
+        saml_metadata_xml: str | None = None,
+        email_domains: list[str] | None = None,
+        enforce_saml: bool | None = None,
+        sync_user_roles: bool | None = None,
+        sign_authn: bool | None = None,
+        project_assign: bool = False,
+    ) -> None:
+        self.dry_run = dry_run
+        self.project_assign = project_assign
+        self.logger = self._build_logger(verbose)
+
+        self.orgs_spaces = OrgSpaceService(
+            api_key=api_key,
+            logger=self.logger,
+            dry_run=dry_run,
+            arize_app_url=arize_app_url,
+        )
+        self.roles = RolesCache(api_key=api_key, logger=self.logger)
+        self.saml = SamlIdpService(
+            execute_graphql=self.orgs_spaces.execute_graphql,
+            logger=self.logger,
+            dry_run=dry_run,
+            saml_metadata_url=saml_metadata_url,
+            saml_metadata_xml=saml_metadata_xml,
+            email_domains=email_domains,
+            enforce_saml=enforce_saml,
+            sync_user_roles=sync_user_roles,
+            sign_authn=sign_authn,
+        )
+        if project_assign:
+            self.project_svc = ProjectService(
+                api_key=api_key,
+                logger=self.logger,
+                dry_run=dry_run,
+            )
+
+        self._init_counters()
+
+    # ── Construction helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_logger(verbose: bool) -> logging.Logger:
+        """Configure (or re-configure) the package logger; DEBUG iff verbose.
+
+        Idempotent: clears any handlers from a previous construction so we
+        don't print duplicate log lines when the runner is instantiated more
+        than once in the same process (e.g. tests, embedding scripts).
+        """
+        logger = logging.getLogger("arize_bulk_setup")
+        logger.handlers.clear()
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+        logger.propagate = False
+        return logger
+
+    def _init_counters(self) -> None:
+        """Reset all summary counters. Called once per runner."""
+        self.orgs_created = 0
+        self.orgs_existed = 0
+        self.spaces_created = 0
+        self.spaces_existed = 0
+        self.mappings_created = 0
+        self.mappings_existed = 0
+        self.legacy_auto_conversions = 0
+        self.projects_created = 0
+        self.projects_existed = 0
+        self.users_created_for_project = 0
+        self.project_assignments_created = 0
+        self.project_assignments_existed = 0
+        self._counted_orgs: set[str] = set()
+        self._counted_spaces: set[str] = set()
+        self._counted_projects: set[str] = set()
+
+    # ── Row processor ─────────────────────────────────────────────────────────
+
+    def process_row(self, row: dict[str, str], row_number: int) -> RowResult:
+        """Validate one CSV row, resolve org/space, and queue a SAML mapping.
+
+        Returns a `RowResult` whose `status` is one of `created`, `already_exists`,
+        `dry_run`, or `error`. Errors are caught and recorded on the row rather
+        than raised, so a single bad row doesn't abort the rest of the batch.
+        """
+        org_name = (row.get("organization") or "").strip()
+        space_name = (row.get("space") or "").strip()
+        arize_org_role = (row.get("arize_org_role") or "").strip().lower()
+        # Preserve the raw value (case + whitespace stripped) for custom-role lookup
+        # and error messages. The builtin-alias check below lowercases as needed.
+        arize_space_role_raw = (row.get("arize_space_role") or "").strip()
+        attr_name = (row.get("saml_attribute_name") or "").strip()
+        attr_value = (row.get("saml_attribute_value") or "").strip()
+
+        project_name = (row.get("project") or "").strip()
+        project_emails = (row.get("project_emails") or "").strip()
+
+        # A project-only row has project columns set but SAML attribute columns
+        # empty — the SAML phase is skipped entirely. Useful when the SAML
+        # mapping already exists and only project creation + user assignment is needed.
+        is_project_only = (
+            self.project_assign
+            and bool(project_name)
+            and not attr_name
+            and not attr_value
+        )
+
+        result = RowResult(
+            row_number=row_number,
+            organization=org_name,
+            space=space_name,
+            arize_org_role=arize_org_role,
+            arize_space_role=arize_space_role_raw,
+            saml_attribute_name=attr_name,
+            saml_attribute_value=attr_value,
+            project=project_name,
+            project_emails=project_emails,
+        )
+
+        if is_project_only:
+            validation_error = _validate_project_only_row(org_name, space_name, arize_space_role_raw)
+        else:
+            validation_error = _validate_row(
+                org_name,
+                space_name,
+                arize_org_role,
+                arize_space_role_raw,
+                attr_name,
+                attr_value,
+            )
+        if validation_error:
+            result.status = "error"
+            result.error_message = validation_error
+            return result
+
+        space_role, is_custom_space_role = _classify_space_role(arize_space_role_raw)
+
+        try:
+            org_id = self._resolve_org(org_name, row_number)
+            space_id = self._resolve_space(org_id, org_name, space_name, row_number)
+
+            if is_project_only:
+                # No SAML mapping — status reflects the project phase outcome.
+                result.status = "dry_run" if self.dry_run else "created"
+            else:
+                org_role = ROLE_ALIAS[arize_org_role]
+
+                # SAML is loaded by run()'s pre-flight before any row reaches here.
+
+                # Resolve a custom RBAC role (if any) to its relay global ID.
+                space_rbac_role_id = ""
+                if is_custom_space_role:
+                    try:
+                        space_rbac_role_id = self.roles.resolve_custom_space_role(
+                            arize_space_role_raw
+                        )
+                    except ValueError as exc:
+                        if not self.dry_run:
+                            raise
+                        # Dry-run: warn but don't fail the row. Skip queuing the
+                        # mapping since we don't have a relay ID, and let the
+                        # operator fix the CSV (or create the role) before rerunning.
+                        self.logger.warning("Row %d: %s", row_number, exc)
+                        result.status = "dry_run"
+                        result.note = (
+                            f"Custom role '{arize_space_role_raw}' does not exist on "
+                            "this account — this row would fail in a real run. "
+                            "Create the role in the Arize UI or fix the CSV name, "
+                            "then rerun."
+                        )
+                        return result
+
+                self._process_saml_mapping(
+                    result=result,
+                    row_number=row_number,
+                    org_id=org_id,
+                    space_id=space_id,
+                    space_name=space_name,
+                    arize_org_role=arize_org_role,
+                    arize_space_role_raw=arize_space_role_raw,
+                    org_role=org_role,
+                    space_role=space_role,
+                    space_rbac_role_id=space_rbac_role_id,
+                    attr_name=attr_name,
+                    attr_value=attr_value,
+                )
+
+            if self.project_assign and project_name:
+                self._process_project_assignment(
+                    result=result,
+                    row_number=row_number,
+                    space_id=space_id,
+                    space_name=space_name,
+                    org_name=org_name,
+                    arize_org_role=arize_org_role or "member",
+                    arize_space_role_raw=arize_space_role_raw,
+                    project_name=project_name,
+                    project_emails=project_emails,
+                )
+
+        except Exception as exc:
+            result.status = "error"
+            result.error_message = str(exc)
+            # Include the traceback only at DEBUG (--verbose). At INFO, the
+            # exception's str() is usually a complete GraphQL/REST error
+            # payload — the Python traceback adds no actionable detail and
+            # is repeated for every row that hits the same backend issue.
+            self.logger.error(
+                "Row %d failed: %s",
+                row_number,
+                exc,
+                exc_info=self.logger.isEnabledFor(logging.DEBUG),
+            )
+
+        return result
+
+    # ── process_row helpers (one concern each) ────────────────────────────────
+
+    def _resolve_org(self, org_name: str, row_number: int) -> str:
+        """Resolve an org and bump the orgs counters once per unique id."""
+        org_id, org_status = self.orgs_spaces.resolve_org(org_name)
+        if org_id not in self._counted_orgs:
+            self._counted_orgs.add(org_id)
+            if org_status in ("created", "dry_run"):
+                self.orgs_created += 1
+            elif org_status == "already_exists":
+                self.orgs_existed += 1
+        self.logger.debug(
+            "Row %d: org '%s' — %s (%s)", row_number, org_name, org_status, org_id
+        )
+        return org_id
+
+    def _resolve_space(
+        self, org_id: str, org_name: str, space_name: str, row_number: int
+    ) -> str:
+        """Resolve a space and bump the spaces counters once per unique id."""
+        space_id, space_status = self.orgs_spaces.resolve_space(
+            org_id, org_name, space_name
+        )
+        if space_id not in self._counted_spaces:
+            self._counted_spaces.add(space_id)
+            if space_status in ("created", "dry_run"):
+                self.spaces_created += 1
+            elif space_status == "already_exists":
+                self.spaces_existed += 1
+        self.logger.debug(
+            "Row %d: space '%s' — %s (%s)",
+            row_number,
+            space_name,
+            space_status,
+            space_id,
+        )
+        return space_id
+
+    def _process_saml_mapping(
+        self,
+        *,
+        result: RowResult,
+        row_number: int,
+        org_id: str,
+        space_id: str,
+        space_name: str,
+        arize_org_role: str,
+        arize_space_role_raw: str,
+        org_role: str,
+        space_role: str,
+        space_rbac_role_id: str,
+        attr_name: str,
+        attr_value: str,
+    ) -> None:
+        """Set `result.status` and either record an exact match or queue a new mapping."""
+        display_space_role = arize_space_role_raw or "n/a"
+        if self.saml.mapping_exists(
+            space_id, org_role, space_role, space_rbac_role_id, attr_name, attr_value
+        ):
+            self.mappings_existed += 1
+            result.status = "already_exists"
+            self.saml.record_exact_match(
+                row_number, space_id, space_role, space_rbac_role_id
+            )
+            self.logger.debug(
+                "Row %d: SAML mapping (%s=%s → %s, org:%s/space:%s) already exists — skipping",
+                row_number,
+                attr_name,
+                attr_value,
+                space_name,
+                arize_org_role,
+                display_space_role,
+            )
+            return
+
+        if self.dry_run:
+            self.logger.info(
+                "[DRY RUN] Row %d: Would create SAML mapping (%s=%s → %s, org:%s/space:%s)",
+                row_number,
+                attr_name,
+                attr_value,
+                space_name,
+                arize_org_role,
+                display_space_role,
+            )
+            result.status = "dry_run"
+        else:
+            result.status = "created"
+            self.logger.debug(
+                "Row %d: SAML mapping (%s=%s → %s, org:%s/space:%s) queued",
+                row_number,
+                attr_name,
+                attr_value,
+                space_name,
+                arize_org_role,
+                display_space_role,
+            )
+        self.saml.queue_mapping(
+            PendingSAMLMapping(
+                row_number=row_number,
+                org_id=org_id,
+                space_id=space_id,
+                org_role=org_role,
+                space_role=space_role,
+                space_rbac_role_id=space_rbac_role_id,
+                attr_name=attr_name,
+                attr_value=attr_value,
+            )
+        )
+
+    def _process_project_assignment(
+        self,
+        *,
+        result: RowResult,
+        row_number: int,
+        space_id: str,
+        space_name: str,
+        org_name: str,
+        arize_org_role: str,
+        arize_space_role_raw: str,
+        project_name: str,
+        project_emails: str,
+    ) -> None:
+        """Create/find the project, restrict it, and assign all listed emails."""
+        project_role = arize_space_role_raw.lower()
+
+        # Validate emails present.
+        emails = [e.strip() for e in project_emails.split(",") if e.strip()]
+        if not emails:
+            result.status = "error"
+            result.error_message = (
+                "project_emails is required and must contain at least one email "
+                "when 'project' is set"
+            )
+            return
+
+        label = f"{org_name}/{space_name}/{project_name}"
+
+        try:
+            # Resolve project role relay ID.
+            # Legacy space roles (admin, member, viewer, annotator) don't have relay
+            # IDs in GET /v2/roles, so map them to their auto-created custom RBAC
+            # equivalents (Space Admin, Space Member, Space Read-Only, Space Annotator).
+            if project_role in ROLE_ALIAS:
+                role_id, _ = self.roles.ensure_legacy_equivalent_role(ROLE_ALIAS[project_role])
+            else:
+                role_id = self.roles.resolve_custom_space_role(arize_space_role_raw)
+
+            # Create/find project.
+            project_id, proj_status = self.project_svc.resolve_project(
+                space_id, space_name, project_name
+            )
+            if project_id not in self._counted_projects:
+                self._counted_projects.add(project_id)
+                if proj_status in ("created", "dry_run"):
+                    self.projects_created += 1
+                elif proj_status == "already_exists":
+                    self.projects_existed += 1
+            self.logger.debug(
+                "Row %d: project '%s' — %s (%s)", row_number, project_name, proj_status, project_id
+            )
+
+            # Restrict project.
+            restrict_status = self.project_svc.restrict_project(project_id, label)
+            self.logger.debug("Row %d: restrict %s — %s", row_number, label, restrict_status)
+
+            # Assign each email.
+            assigned, already, created_users = 0, 0, 0
+            for email in emails:
+                user_id, user_status = self.project_svc.resolve_user(email, arize_org_role)
+                if user_status in ("created", "dry_run"):
+                    created_users += 1
+                    self.users_created_for_project += 1
+
+                binding_status = self.project_svc.assign_user_to_project(
+                    user_id, project_id, role_id, project_name=project_name
+                )
+                if binding_status in ("granted", "dry_run"):
+                    assigned += 1
+                elif binding_status == "already_granted":
+                    already += 1
+
+            self.project_assignments_created += assigned
+            self.project_assignments_existed += already
+
+            note_parts = [f"project '{project_name}': {restrict_status}"]
+            if assigned:
+                note_parts.append(f"{assigned} user(s) assigned ({project_role})")
+            if already:
+                note_parts.append(f"{already} already had access")
+            project_note = "; ".join(note_parts)
+
+            if result.note:
+                result.note = f"{result.note} | {project_note}"
+            else:
+                result.note = project_note
+
+        except Exception as exc:
+            result.status = "error"
+            result.error_message = str(exc)
+            self.logger.error(
+                "Row %d project phase failed: %s",
+                row_number,
+                exc,
+                exc_info=self.logger.isEnabledFor(logging.DEBUG),
+            )
+
+    # ── Top-level run ─────────────────────────────────────────────────────────
+
+    def run(self, rows: list[dict[str, str]]) -> list[RowResult]:
+        """Process all CSV rows, resolve conflicts, then flush queued SAML mappings.
+
+        Returns one `RowResult` per input row, in the same order. The overall
+        exit code is determined by the caller (`cli.main`) based on whether any
+        row's final status is `error`.
+        """
+        # Pre-flight: load the SAML IdP once before the row loop. Without this,
+        # every row would re-fire the same getSAMLIdP call and emit the same
+        # error+traceback. We distinguish two distinct failures:
+        #   - RuntimeError: our own _validate_creation_params — the IdP simply
+        #     doesn't exist on this account and we don't have the params to
+        #     create one. The message already includes actionable guidance.
+        #   - Any other exception: the API call itself failed (network/auth/
+        #     transport/schema) — a different problem from "IdP doesn't exist".
+        try:
+            self.saml.ensure_loaded()
+        except RuntimeError as exc:
+            self.logger.error("%s", exc)
+            return [
+                self._row_with_error(row, i, str(exc))
+                for i, row in enumerate(rows, start=1)
+            ]
+        except Exception as exc:
+            error_message = f"Could not load SAML configuration from Arize: {exc}"
+            self.logger.exception(error_message)
+            return [
+                self._row_with_error(row, i, error_message)
+                for i, row in enumerate(rows, start=1)
+            ]
+
+        results: list[RowResult] = []
+        for i, row in enumerate(rows, start=1):
+            results.append(self.process_row(row, i))
+
+        # Client-side check that mirrors the backend rule: a space can use
+        # either standard or custom roles across mappings, but not both.
+        # Whenever a conflict touches a space the CSV references, every legacy
+        # use on that space (pending row, already_exists match, or pre-existing
+        # IdP entry) is promoted to a custom RBAC role mirroring its permission
+        # set. Custom is never demoted to legacy.
+        results_by_row = {r.row_number: r for r in results}
+
+        def _on_legacy_converted(
+            row_number: int,
+            legacy_key: str,
+            custom_name: str,
+            kind: str = "pending",
+        ) -> None:
+            self.legacy_auto_conversions += 1
+            r = results_by_row.get(row_number)
+            if r is None:
+                return
+            if kind == "matched":
+                r.note = (
+                    f"Existing legacy mapping was auto-promoted to custom role "
+                    f"'{custom_name}' because another mapping on this space "
+                    "uses a custom role."
+                )
+            else:
+                r.note = (
+                    f"Auto-converted legacy '{legacy_key}' to custom role "
+                    f"'{custom_name}' because this space also uses a custom role "
+                    "in another mapping."
+                )
+
+        resolve_role_type_conflicts(
+            saml=self.saml,
+            space_id_to_name=self.orgs_spaces.space_id_to_name(),
+            results=results,
+            logger=self.logger,
+            on_existed_to_error=self._decrement_existed_on_error,
+            roles=self.roles,
+            on_legacy_converted=_on_legacy_converted,
+        )
+
+        # Reconcile any pending mappings against the (possibly preflight-mutated)
+        # existing IdP state. Pending entries that match an existing mapping
+        # by (attr, val, org_role) get absorbed in-place; their rows are
+        # re-classified or annotated below.
+        def _on_absorbed(
+            row_number: int,
+            kind: str,
+            attr_name: str,
+            attr_value: str,
+            prior_role_label: str,
+        ) -> None:
+            r = results_by_row.get(row_number)
+            if r is None:
+                return
+            attr_pair = f"{attr_name}={attr_value}"
+            display_prior = (
+                self.roles.id_to_name(prior_role_label)
+                if prior_role_label and prior_role_label.startswith(RELAY_ROLE_ID_PREFIX)
+                else prior_role_label
+            )
+            if kind == "idempotent":
+                r.status = "already_exists"
+                r.note = (
+                    f"Existing SAML mapping already covers this space with "
+                    f"the same role; no change needed."
+                )
+                self.mappings_existed += 1
+                self.logger.info(
+                    "Row %d: existing SAML mapping for %s already covers this space with the same role; no change needed.",
+                    row_number,
+                    attr_pair,
+                )
+            elif kind == "inherited":
+                r.status = "already_exists"
+                r.note = (
+                    f"Existing SAML mapping for {attr_pair} already covers "
+                    f"this org role."
+                )
+                self.mappings_existed += 1
+                self.logger.info(
+                    "Row %d: existing SAML mapping for %s already covers this org role; no change needed.",
+                    row_number,
+                    attr_pair,
+                )
+            elif kind == "replaced":
+                # Status stays 'created' — the IdP state changed.
+                r.note = (
+                    f"Replaced prior role '{display_prior}' on this space "
+                    f"in the existing SAML mapping for {attr_pair}."
+                )
+                self.logger.info(
+                    "Row %d: replaced prior role '%s' on this space in existing SAML mapping for %s.",
+                    row_number,
+                    display_prior,
+                    attr_pair,
+                )
+            elif kind == "extended":
+                r.note = (
+                    f"Added this space to the existing SAML mapping for "
+                    f"{attr_pair}."
+                )
+                self.logger.info(
+                    "Row %d: added this space to existing SAML mapping for %s.",
+                    row_number,
+                    attr_pair,
+                )
+
+        def _on_merged(
+            row_number: int,
+            owner_row_number: int,
+            attr_name: str,
+            attr_value: str,
+        ) -> None:
+            r = results_by_row.get(row_number)
+            if r is None:
+                return
+            r.note = (
+                f"Merged into a single SAML mapping with row {owner_row_number} "
+                f"(same {attr_name}={attr_value} attribute pair)."
+            )
+
+        self.saml.reconcile_pending_into_existing(on_absorbed=_on_absorbed)
+        self.saml.collapse_pending_by_attributes(on_merged=_on_merged)
+
+        if self.dry_run:
+            self.mappings_created = self.saml.pending_count()
+            return results
+
+        # Nothing to flush: no new mappings AND no in-place changes to existing
+        # ones (reconcile may have absorbed everything as idempotent).
+        if not self.saml.needs_flush():
+            return results
+
+        pending_rows = self.saml.pending_row_numbers()
+        created_count = self.saml.pending_count()
+        try:
+            self.saml.flush()
+            self.mappings_created += created_count
+            if created_count:
+                self.logger.info(
+                    "%d new SAML mapping(s) created.", created_count
+                )
+            else:
+                self.logger.info(
+                    "SAML mappings updated in place (no new mappings added)."
+                )
+        except Exception as exc:
+            self.logger.exception("Failed to flush SAML mappings: %s", exc)
+            for r in results:
+                # Status guard: only rows that were queued for creation in this
+                # run should be flipped to error. Pre-flush errors (validation,
+                # preflight conflicts, already_exists) keep their final status.
+                if r.row_number in pending_rows and r.status == "created":
+                    r.status = "error"
+                    r.error_message = f"SAML update failed: {exc}"
+        return results
+
+    @staticmethod
+    def _row_with_error(
+        row: dict[str, str], row_number: int, error_message: str
+    ) -> RowResult:
+        """Build a RowResult that propagates the original CSV fields plus an error.
+
+        Used by the SAML pre-flight to surface the same account-level error on
+        every row without re-running validation per row.
+        """
+        return RowResult(
+            row_number=row_number,
+            organization=(row.get("organization") or "").strip(),
+            space=(row.get("space") or "").strip(),
+            arize_org_role=(row.get("arize_org_role") or "").strip().lower(),
+            arize_space_role=(row.get("arize_space_role") or "").strip(),
+            saml_attribute_name=(row.get("saml_attribute_name") or "").strip(),
+            saml_attribute_value=(row.get("saml_attribute_value") or "").strip(),
+            project=(row.get("project") or "").strip(),
+            project_emails=(row.get("project_emails") or "").strip(),
+            status="error",
+            error_message=error_message,
+        )
+
+    def _decrement_existed_on_error(self, row_number: int) -> None:
+        """Called from the preflight when a row flips already_exists → error.
+
+        process_row optimistically bumped mappings_existed when it saw the
+        already_exists state; the preflight needs to undo that bump so the
+        summary reflects the row's final status.
+        """
+        self.mappings_existed -= 1
+
+
+# ── Pure validation helpers (no I/O, easy to unit test) ──────────────────────
+
+
+def _validate_row(
+    org_name: str,
+    space_name: str,
+    arize_org_role: str,
+    arize_space_role_raw: str,
+    attr_name: str,
+    attr_value: str,
+) -> str:
+    """Return an error message if the row is invalid, else empty string."""
+    missing = [
+        col
+        for col, val in [
+            ("organization", org_name),
+            ("space", space_name),
+            ("arize_org_role", arize_org_role),
+            ("saml_attribute_name", attr_name),
+            ("saml_attribute_value", attr_value),
+        ]
+        if not val
+    ]
+    if missing:
+        return f"Missing required field(s): {', '.join(missing)}"
+
+    if arize_org_role not in VALID_ORG_ROLES:
+        return (
+            f"Invalid arize_org_role '{arize_org_role}'. "
+            f"Must be one of: {', '.join(sorted(VALID_ORG_ROLES))}"
+        )
+
+    if arize_org_role == "admin" and arize_space_role_raw:
+        return (
+            f"Invalid combination: arize_org_role='admin' cannot be paired "
+            f"with arize_space_role='{arize_space_role_raw}'. "
+            "Org admins receive full org access; leave arize_space_role blank."
+        )
+
+    return ""
+
+
+def _validate_project_only_row(
+    org_name: str, space_name: str, arize_space_role_raw: str
+) -> str:
+    """Validate a project-only row (SAML columns intentionally empty).
+
+    Only organization, space, and arize_space_role are required.
+    """
+    missing = [
+        col
+        for col, val in [
+            ("organization", org_name),
+            ("space", space_name),
+            ("arize_space_role", arize_space_role_raw),
+        ]
+        if not val
+    ]
+    if missing:
+        return f"Missing required field(s): {', '.join(missing)}"
+    return ""
+
+
+def _classify_space_role(arize_space_role_raw: str) -> tuple[str, bool]:
+    """Classify a CSV space-role cell.
+
+    Returns (space_role, is_custom_space_role):
+      - "" / None     → ("", False) — inherit from org role
+      - builtin alias → (translated_role, False) — legacy spaceRolesMap
+      - anything else → ("", True)  — custom RBAC; resolved later to relay ID
+    """
+    if not arize_space_role_raw:
+        return "", False
+    lower = arize_space_role_raw.lower()
+    if lower in ROLE_ALIAS:
+        return ROLE_ALIAS[lower], False
+    return "", True
