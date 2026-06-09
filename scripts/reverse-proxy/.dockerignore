@@ -1,0 +1,7 @@
+*.md
+.DS_Store
+__pycache__/
+certs/
+.env
+.env.*
+captured*.jsonl
