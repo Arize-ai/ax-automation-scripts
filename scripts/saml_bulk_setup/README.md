@@ -54,17 +54,23 @@ Each **row** is one rule: “When a user’s SAML attribute matches this value, 
 | `organization` | Name of the Arize **organization** (created if it does not exist). | Yes |
 | `space` | Name of the **space** inside that organization (created if it does not exist). | Yes |
 | `arize_org_role` | Role **in the organization**: `admin`, `member`, `viewer`, or `annotator`. | Yes |
-| `arize_space_role` | Role **in the space**, or leave **empty**—see [Org and space roles](#org-and-space-roles). | No (depends on rule) |
+| `arize_space_role` | Role **in the space**: a built-in role (`admin`, `member`, `viewer`, `annotator`), the **name of a custom role**, or leave **empty**—see [Org and space roles](#org-and-space-roles). | No (depends on rule) |
 | `saml_attribute_name` | SAML attribute that carries group membership (often `groups` or a custom claim). Must match what your IdP sends. | Yes |
 | `saml_attribute_value` | The group or claim **value** that should match (for example `arize-ml-team`). | Yes |
 
 ### Org and space roles
 
-- **`arize_org_role`** is the user’s access at the **organization** level.
+- **`arize_org_role`** is the user’s access at the **organization** level. Use a built-in role only: `admin`, `member`, `viewer`, or `annotator`.
 - **`arize_space_role`** is optional. It sets the user’s role **in the space** on that row. If you leave it **blank**, Arize can align the space role with the org role (for users who are not org admins).
 - If **`arize_org_role` is `admin`**, that user has full access across the org; leave **`arize_space_role` empty** on that row.
 
 `viewer` in the file is accepted; Arize stores it as read-only access.
+
+#### Custom space roles
+
+`arize_space_role` also accepts the **name of a custom role** (an RBAC role defined in Arize), not just the built-in keywords. If the value isn’t one of `admin` / `member` / `viewer` / `annotator`, the tool treats it as a custom role name and looks it up in your account’s **role catalog** via the Arize REST API (`GET /v2/roles`); matching is case-insensitive. Custom roles apply at the **space** level only — `arize_org_role` must still be a built-in role.
+
+The lookup covers every role in the account (predefined and custom) **whether or not anyone is assigned to it yet**, so you can map a role before its first user. A row naming a role that isn’t in the catalog fails with a clear message listing the available role names.
 
 ### Example
 
@@ -73,7 +79,10 @@ organization,space,arize_org_role,arize_space_role,saml_attribute_name,saml_attr
 Acme Corp,ML Platform,admin,,groups,arize-admins
 Acme Corp,ML Platform,member,admin,groups,arize-ml-engineers
 Acme Corp,Fraud Detection,member,,groups,arize-fraud-team
+Acme Corp,Fraud Detection,member,Fraud Investigator,groups,arize-fraud-investigators
 ```
+
+The last row grants the custom **Fraud Investigator** space role.
 
 ---
 
@@ -136,6 +145,7 @@ The tool adds or updates **group-to-role mappings** on your existing SAML setup.
 | `--verbose` | More detailed messages per row (helpful when debugging). |
 | `--output PATH` | Where to write the results file (default: `saml_setup_results.csv`). |
 | `--arize-url URL` | Use a non-default Arize URL if your company uses a dedicated host (default is `https://app.arize.com`). |
+| `--arize-api-url URL` | REST API host used to look up custom roles (default: derived from `--arize-url`, e.g. `https://api.arize.com`). Set this only for custom/on-prem hosts where the API host isn’t `api.<your-app-host>`. |
 
 ---
 
@@ -187,7 +197,8 @@ If some rows fail, the summary tells you how many failed and points you to the r
 | What you see | What to try |
 | --- | --- |
 | **Permission denied / forbidden** | Confirm your API key can manage organizations, spaces, and SAML. You may need an account-level administrator to create or rotate the key. |
-| **Invalid role** | Use only `admin`, `member`, `viewer`, or `annotator` for roles. For org **admin** rows, leave **`arize_space_role`** empty. |
+| **Invalid role** | `arize_org_role` must be `admin`, `member`, `viewer`, or `annotator`. For org **admin** rows, leave **`arize_space_role`** empty. |
+| **Custom role not found** | `arize_space_role` named a role that isn’t in your account’s role catalog (`GET /v2/roles`). Check spelling against the role’s name in Arize (matching is case-insensitive). The error message lists the available role names. If your account uses a custom host, set **`--arize-api-url`** so the lookup hits the right REST endpoint. |
 | **Errors creating SAML / “no IdP”** | For a **new** SAML setup, include **`--email-domains`** and **`--saml-metadata-url`** or **`--saml-metadata-xml`**. Alternatively, complete SAML setup once in the Arize **Settings** UI, then run again with only **`--csv`**. |
 | **Too many requests / slow** | The tool retries automatically. If it keeps failing, wait and run again with a smaller CSV or off-peak hours. |
 | **Users do not get the expected access** | Check that **`saml_attribute_name`** and **`saml_attribute_value`** exactly match what your IdP sends (including spelling and case, per your IdP’s behavior). Review failed rows in **`saml_setup_results.csv`**. |

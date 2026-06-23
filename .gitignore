@@ -1,1 +1,8 @@
 .venv/
+.serena/
+.python-version
+.env
+main.py
+pyproject.toml
+__pycache__/
+.DS_Store
