@@ -5,3 +5,4 @@ Acme Corp,Fraud Detection,member,,groups,arize-fraud-team
 Acme Corp,Fraud Detection,viewer,member,groups,arize-risk-analysts
 Subsidiary Inc,NLP Research,member,admin,groups,arize-nlp-leads
 Subsidiary Inc,NLP Research,member,,groups,arize-nlp-engineers
+Acme Corp,Fraud Detection,member,Fraud Investigator,groups,arize-fraud-investigators

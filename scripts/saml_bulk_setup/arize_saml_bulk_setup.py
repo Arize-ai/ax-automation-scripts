@@ -79,6 +79,7 @@ _CREATE_SAML_IDP = gql("""
                     id
                     attributesMap
                     spaceRolesMap
+                    spaceRbacRolesMap
                     isAccountAdmin
                     orgRole {
                         orgId
@@ -108,6 +109,7 @@ _GET_SAML_IDP = gql("""
                             id
                             attributesMap
                             spaceRolesMap
+                            spaceRbacRolesMap
                             isAccountAdmin
                             orgRole {
                                 orgId
@@ -131,9 +133,38 @@ _UPDATE_SAML_IDP = gql("""
                     id
                     attributesMap
                     spaceRolesMap
+                    spaceRbacRolesMap
                 }
             }
             error
+        }
+    }
+""")
+
+# Custom (RBAC) roles aren't exposed by a top-level list query, so we discover
+# them by name through the users already bound to a role in the space. The
+# space's users are paginated (Relay connection) — see _load_custom_roles_for_space.
+_CUSTOM_ROLES_PAGE_SIZE = 100
+
+_GET_SPACE_CUSTOM_ROLES = gql("""
+    query getSpaceCustomRoles($id: ID!, $first: Int!, $after: String) {
+        node(id: $id) {
+            ... on Space {
+                spaceUsers(first: $first, after: $after) {
+                    edges {
+                        node {
+                            customRole {
+                                id
+                                name
+                            }
+                        }
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
         }
     }
 """)
@@ -163,9 +194,13 @@ class PendingSAMLMapping:
     org_id: str
     space_id: str
     org_role: str  # translated: "admin" | "member" | "readOnly" | "annotator"
-    space_role: str  # translated: "admin" | "member" | "readOnly" | "annotator"
+    space_role: str  # built-in: "admin" | "member" | "readOnly" | "annotator" | ""
     attr_name: str
     attr_value: str
+    # When the space role is a custom RBAC role, space_role is "" and this holds
+    # the role's Relay global ID (emitted as spaceRbacRolesMap instead of
+    # spaceRolesMap — the two are mutually exclusive per mapping).
+    space_custom_role_id: Optional[str] = None
 
 @dataclass
 class SamlFlags:
@@ -254,6 +289,9 @@ class BulkSetupRunner:
             tuple[str, str], str
         ] = {}  # (org_id, space_name) → space_id
         self._spaces_loaded_for: set[str] = set()  # org_ids already fetched
+
+        # Custom (RBAC) role lookup, keyed by space_id → {role_name_lower: role_id}
+        self._custom_role_cache: dict[str, dict[str, str]] = {}
 
         # SAML IdP creation params (used if no IdP exists yet)
         self._saml_metadata_url = saml_metadata_url
@@ -394,6 +432,69 @@ class BulkSetupRunner:
         self._space_cache[cache_key] = new_space_id
         return new_space_id, "created"
 
+    # ── Custom (RBAC) role helpers ────────────────────────────────────────────
+
+    def _load_custom_roles_for_space(self, space_id: str) -> dict[str, str]:
+        """Return {role_name_lower: role_id} for custom roles in use in a space.
+
+        Arize exposes no top-level "list custom roles" query, so the only way to
+        map a role *name* to its Relay global ID is via the users already bound
+        to a custom role in that space. A role that exists but isn't yet assigned
+        to anyone in the space cannot be discovered this way.
+        """
+        if space_id in self._custom_role_cache:
+            return self._custom_role_cache[space_id]
+
+        self.logger.debug("Loading custom roles for space %s…", space_id)
+        roles: dict[str, str] = {}
+        after: Optional[str] = None
+        while True:
+            result = with_retry(
+                lambda after=after: self._gql.execute(
+                    _GET_SPACE_CUSTOM_ROLES,
+                    variable_values={
+                        "id": space_id,
+                        "first": _CUSTOM_ROLES_PAGE_SIZE,
+                        "after": after,
+                    },
+                ),
+                "getSpaceCustomRoles",
+                self.logger,
+            )
+            space_users = ((result or {}).get("node") or {}).get("spaceUsers") or {}
+            for edge in space_users.get("edges") or []:
+                custom = ((edge or {}).get("node") or {}).get("customRole")
+                if custom and custom.get("name") and custom.get("id"):
+                    roles[custom["name"].strip().lower()] = custom["id"]
+            page_info = space_users.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+            if not after:  # defensive: no cursor means we can't advance
+                break
+        self._custom_role_cache[space_id] = roles
+        self.logger.debug(
+            "  found %d custom role(s) in space %s: %s",
+            len(roles),
+            space_id,
+            ", ".join(sorted(roles)) or "(none)",
+        )
+        return roles
+
+    def _resolve_custom_role(self, space_id: str, role_name: str) -> str:
+        """Resolve a custom role name to its global ID, or raise if not found."""
+        roles = self._load_custom_roles_for_space(space_id)
+        role_id = roles.get(role_name.strip().lower())
+        if role_id is None:
+            available = ", ".join(sorted(roles)) or "(none discoverable)"
+            raise RuntimeError(
+                f"Custom role '{role_name}' was not found in this space. "
+                "Custom roles are discovered through users already assigned to "
+                "them in the space, so the role must be bound to at least one "
+                f"user there first. Discoverable custom roles: {available}."
+            )
+        return role_id
+
     # ── SAML helpers ──────────────────────────────────────────────────────────
 
     def _load_saml_idp(self) -> None:
@@ -512,6 +613,7 @@ class BulkSetupRunner:
         space_role: str,
         attr_name: str,
         attr_value: str,
+        space_custom_role_id: Optional[str] = None,
     ) -> bool:
         """True if any existing or already-queued mapping covers this combo.
 
@@ -521,16 +623,25 @@ class BulkSetupRunner:
         for mapping in self._saml_existing_mappings:
             attrs = mapping.get("attributesMap") or []
             spaces = mapping.get("spaceRolesMap") or []
+            rbac_spaces = mapping.get("spaceRbacRolesMap") or []
             existing_org_role = (mapping.get("orgRole") or {}).get("roleId", "")
             has_attr = any(
                 len(p) >= 2 and p[0] == attr_name and p[1] == attr_value for p in attrs
             )
             if not has_attr or existing_org_role != org_role:
                 continue
+            # Custom RBAC space role — verify it's present in spaceRbacRolesMap
+            if space_custom_role_id:
+                if any(
+                    len(p) >= 2 and p[0] == space_id and p[1] == space_custom_role_id
+                    for p in rbac_spaces
+                ):
+                    return True
+                continue
             # No space role — attr + org role is the full identity
             if not space_role:
                 return True
-            # Space role specified — verify it's present in spaceRolesMap
+            # Built-in space role specified — verify it's present in spaceRolesMap
             if any(
                 len(p) >= 2 and p[0] == space_id and p[1] == space_role for p in spaces
             ):
@@ -541,8 +652,17 @@ class BulkSetupRunner:
             and p.attr_value == attr_value
             and p.org_role == org_role
             and (
-                not space_role
-                or (p.space_id == space_id and p.space_role == space_role)
+                p.space_id == space_id
+                and p.space_custom_role_id == space_custom_role_id
+                if space_custom_role_id
+                else (
+                    not space_role
+                    or (
+                        p.space_id == space_id
+                        and p.space_role == space_role
+                        and not p.space_custom_role_id
+                    )
+                )
             )
             for p in self._saml_pending
         )
@@ -555,9 +675,12 @@ class BulkSetupRunner:
                 "orgRole": {"orgId": p.org_id, "roleId": p.org_role},
                 "isAccountAdmin": False,
             }
-            # Include space role only when explicitly set — omitting it lets the
-            # backend inherit the space role from the org role.
-            if p.space_role:
+            # Custom RBAC role and built-in role are mutually exclusive per
+            # mapping. Include a space role only when explicitly set — omitting
+            # both lets the backend inherit the space role from the org role.
+            if p.space_custom_role_id:
+                entry["spaceRbacRolesMap"] = [[p.space_id, p.space_custom_role_id]]
+            elif p.space_role:
                 entry["spaceRolesMap"] = [[p.space_id, p.space_role]]
             entries.append(entry)
         return entries
@@ -586,9 +709,16 @@ class BulkSetupRunner:
         for m in self._saml_existing_mappings:
             entry: dict = {
                 "attributesMap": m.get("attributesMap") or [],
-                "spaceRolesMap": m.get("spaceRolesMap") or [],
                 "isAccountAdmin": m.get("isAccountAdmin") or False,
             }
+            # spaceRolesMap and spaceRbacRolesMap are mutually exclusive per
+            # mapping — preserve whichever the existing mapping actually used so
+            # custom-role mappings survive a full-replace update.
+            rbac_map = m.get("spaceRbacRolesMap") or []
+            if rbac_map:
+                entry["spaceRbacRolesMap"] = rbac_map
+            else:
+                entry["spaceRolesMap"] = m.get("spaceRolesMap") or []
             if m.get("id"):
                 entry["id"] = m["id"]
             if m.get("orgRole"):
@@ -639,7 +769,9 @@ class BulkSetupRunner:
         org_name = (row.get("organization") or "").strip()
         space_name = (row.get("space") or "").strip()
         arize_org_role = (row.get("arize_org_role") or "").strip().lower()
-        arize_space_role = (row.get("arize_space_role") or "").strip().lower()
+        # Preserve original case — arize_space_role may be a custom role *name*
+        # (matched case-insensitively), not just a built-in role keyword.
+        arize_space_role = (row.get("arize_space_role") or "").strip()
         attr_name = (row.get("saml_attribute_name") or "").strip()
         attr_value = (row.get("saml_attribute_value") or "").strip()
 
@@ -679,6 +811,13 @@ class BulkSetupRunner:
             )
             return result
 
+        # Classify the space role: blank → inherit; a recognised keyword → a
+        # built-in role; anything else → a custom RBAC role name resolved later
+        # (once the space ID is known) via _resolve_custom_role().
+        space_role_key = arize_space_role.lower()
+        is_builtin_space_role = space_role_key in VALID_SPACE_ROLES
+        is_custom_space_role = bool(arize_space_role) and not is_builtin_space_role
+
         if arize_org_role == "admin":
             # Org admin gets full org access — a space role is not applicable
             if arize_space_role:
@@ -689,21 +828,9 @@ class BulkSetupRunner:
                     "Org admins receive full org access; leave arize_space_role blank."
                 )
                 return result
-        else:
-            # Space role is optional for non-admin org roles — when omitted the
-            # backend inherits the space role from the org role.
-            # If a value IS provided it must be a recognised role name.
-            if arize_space_role and arize_space_role not in VALID_SPACE_ROLES:
-                result.status = "error"
-                result.error_message = (
-                    f"Invalid arize_space_role '{arize_space_role}'. "
-                    f"Must be one of: {', '.join(sorted(VALID_SPACE_ROLES))}, "
-                    "or leave blank to inherit from arize_org_role."
-                )
-                return result
 
         org_role = _ROLE_ALIAS[arize_org_role]
-        space_role = _ROLE_ALIAS[arize_space_role] if arize_space_role else ""
+        space_role = _ROLE_ALIAS[space_role_key] if is_builtin_space_role else ""
 
         try:
             # 1. Resolve org (arize_toolkit: get_all_organizations / raw GQL: createOrganization)
@@ -734,11 +861,35 @@ class BulkSetupRunner:
                 space_id,
             )
 
-            # 3. SAML mapping
+            # 3. Resolve a custom RBAC space role to its global ID, if one was
+            #    named. Deferred to here because the lookup is space-scoped.
+            space_custom_role_id: Optional[str] = None
+            if is_custom_space_role:
+                if self.dry_run and space_id.startswith("__dry_run_"):
+                    # New space in a dry run has no real ID to query against.
+                    space_custom_role_id = "__dry_run_custom_role__"
+                    self.logger.info(
+                        "[DRY RUN] Row %d: would resolve custom role '%s' "
+                        "in new space '%s'",
+                        row_number,
+                        arize_space_role,
+                        space_name,
+                    )
+                else:
+                    space_custom_role_id = self._resolve_custom_role(
+                        space_id, arize_space_role
+                    )
+
+            # 4. SAML mapping
             self._load_saml_idp()
 
             if self._mapping_exists(
-                space_id, org_role, space_role, attr_name, attr_value
+                space_id,
+                org_role,
+                space_role,
+                attr_name,
+                attr_value,
+                space_custom_role_id,
             ):
                 self.mappings_existed += 1
                 result.status = "already_exists"
@@ -783,6 +934,7 @@ class BulkSetupRunner:
                         space_role=space_role,
                         attr_name=attr_name,
                         attr_value=attr_value,
+                        space_custom_role_id=space_custom_role_id,
                     )
                 )
 
