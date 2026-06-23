@@ -21,15 +21,33 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional, TypeVar
+from urllib.parse import urlparse
 
+import requests
 from arize_toolkit import Client as ArizeClient
 from gql import gql
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 ARIZE_APP_URL = "https://app.arize.com"
+ARIZE_API_URL = "https://api.arize.com"  # REST API host (roles live here)
+ROLES_PAGE_SIZE = 100  # /v2/roles max page size
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0  # seconds
+
+
+def derive_api_url(app_url: str) -> str:
+    """Map an Arize app URL to its REST API host.
+
+    https://app.arize.com            → https://api.arize.com
+    https://app.eu-west-1a.arize.com → https://api.eu-west-1a.arize.com
+    Anything that doesn't start with the "app." convention falls back to the
+    default global REST host; override with --arize-api-url for custom hosts.
+    """
+    parsed = urlparse(app_url)
+    if parsed.netloc.startswith("app."):
+        return f"{parsed.scheme}://api.{parsed.netloc[len('app.'):]}"
+    return ARIZE_API_URL
 
 # CSV accepts "viewer" as a human-friendly alias; Arize GraphQL uses "readOnly"
 _ROLE_ALIAS: dict[str, str] = {
@@ -141,33 +159,9 @@ _UPDATE_SAML_IDP = gql("""
     }
 """)
 
-# Custom (RBAC) roles aren't exposed by a top-level list query, so we discover
-# them by name through the users already bound to a role in the space. The
-# space's users are paginated (Relay connection) — see _load_custom_roles_for_space.
-_CUSTOM_ROLES_PAGE_SIZE = 100
-
-_GET_SPACE_CUSTOM_ROLES = gql("""
-    query getSpaceCustomRoles($id: ID!, $first: Int!, $after: String) {
-        node(id: $id) {
-            ... on Space {
-                spaceUsers(first: $first, after: $after) {
-                    edges {
-                        node {
-                            customRole {
-                                id
-                                name
-                            }
-                        }
-                    }
-                    pageInfo {
-                        hasNextPage
-                        endCursor
-                    }
-                }
-            }
-        }
-    }
-""")
+# Custom (RBAC) roles are resolved by name through the REST API
+# (GET /v2/roles) — see _load_roles(). This lists the account's full role
+# catalog (predefined + custom) regardless of whether anyone is assigned yet.
 
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
@@ -256,6 +250,7 @@ class BulkSetupRunner:
         dry_run: bool,
         verbose: bool,
         arize_app_url: str = ARIZE_APP_URL,
+        arize_api_url: Optional[str] = None,
         saml_metadata_url: Optional[str] = None,
         saml_metadata_xml: Optional[str] = None,
         email_domains: Optional[list[str]] = None,
@@ -264,6 +259,10 @@ class BulkSetupRunner:
         sign_authn: Optional[bool] = None,
     ) -> None:
         self.dry_run = dry_run
+        self._api_key = api_key
+        # REST host for the roles API (GET /v2/roles). Derived from the app URL
+        # unless explicitly overridden for a custom host.
+        self._api_base = (arize_api_url or derive_api_url(arize_app_url)).rstrip("/")
 
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
@@ -290,8 +289,11 @@ class BulkSetupRunner:
         ] = {}  # (org_id, space_name) → space_id
         self._spaces_loaded_for: set[str] = set()  # org_ids already fetched
 
-        # Custom (RBAC) role lookup, keyed by space_id → {role_name_lower: role_id}
-        self._custom_role_cache: dict[str, dict[str, str]] = {}
+        # Account-wide custom (RBAC) role lookup {role_name_lower: role_id},
+        # loaded exactly once from the REST roles API on first use. A failed
+        # load is also remembered (_roles_error) so we never re-hit the API.
+        self._roles_cache: Optional[dict[str, str]] = None
+        self._roles_error: Optional[Exception] = None
 
         # SAML IdP creation params (used if no IdP exists yet)
         self._saml_metadata_url = saml_metadata_url
@@ -434,64 +436,94 @@ class BulkSetupRunner:
 
     # ── Custom (RBAC) role helpers ────────────────────────────────────────────
 
-    def _load_custom_roles_for_space(self, space_id: str) -> dict[str, str]:
-        """Return {role_name_lower: role_id} for custom roles in use in a space.
+    def _fetch_roles_page(self, cursor: Optional[str]) -> dict:
+        """GET one page of /v2/roles. Raises on non-2xx (429 → retryable)."""
+        params: dict[str, object] = {"limit": ROLES_PAGE_SIZE}
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{self._api_base}/v2/roles",
+            params=params,
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout=30,
+        )
+        # Surface 429 as a retryable error for with_retry; other 4xx/5xx raise.
+        resp.raise_for_status()
+        return resp.json()
 
-        Arize exposes no top-level "list custom roles" query, so the only way to
-        map a role *name* to its Relay global ID is via the users already bound
-        to a custom role in that space. A role that exists but isn't yet assigned
-        to anyone in the space cannot be discovered this way.
+    def _load_roles(self) -> dict[str, str]:
+        """Return {role_name_lower: role_id} for the account's full role catalog.
+
+        Uses the REST roles API (GET /v2/roles), which lists predefined and
+        custom roles account-wide regardless of whether anyone is assigned to
+        them yet. The catalog is fetched exactly once per run and memoised: a
+        successful load is cached in _roles_cache, and a failed load is cached
+        in _roles_error so we re-raise instead of hammering the API per row.
+        Pagination (opaque cursor) only adds requests when the catalog spans
+        more than one page.
         """
-        if space_id in self._custom_role_cache:
-            return self._custom_role_cache[space_id]
+        if self._roles_cache is not None:
+            return self._roles_cache
+        if self._roles_error is not None:
+            raise self._roles_error
 
-        self.logger.debug("Loading custom roles for space %s…", space_id)
-        roles: dict[str, str] = {}
-        after: Optional[str] = None
-        while True:
-            result = with_retry(
-                lambda after=after: self._gql.execute(
-                    _GET_SPACE_CUSTOM_ROLES,
-                    variable_values={
-                        "id": space_id,
-                        "first": _CUSTOM_ROLES_PAGE_SIZE,
-                        "after": after,
-                    },
-                ),
-                "getSpaceCustomRoles",
-                self.logger,
-            )
-            space_users = ((result or {}).get("node") or {}).get("spaceUsers") or {}
-            for edge in space_users.get("edges") or []:
-                custom = ((edge or {}).get("node") or {}).get("customRole")
-                if custom and custom.get("name") and custom.get("id"):
-                    roles[custom["name"].strip().lower()] = custom["id"]
-            page_info = space_users.get("pageInfo") or {}
-            if not page_info.get("hasNextPage"):
-                break
-            after = page_info.get("endCursor")
-            if not after:  # defensive: no cursor means we can't advance
-                break
-        self._custom_role_cache[space_id] = roles
+        try:
+            self.logger.debug("Loading roles from %s/v2/roles…", self._api_base)
+            roles: dict[str, str] = {}
+            cursor: Optional[str] = None
+            pages = 0
+            while True:
+                payload = with_retry(
+                    lambda cursor=cursor: self._fetch_roles_page(cursor),
+                    "listRoles",
+                    self.logger,
+                )
+                # Validate the response shape so a malformed 200 surfaces as an
+                # error rather than masquerading as an empty catalog.
+                if not isinstance(payload, dict) or not isinstance(
+                    payload.get("roles"), list
+                ):
+                    raise RuntimeError(
+                        f"Unexpected response from {self._api_base}/v2/roles: "
+                        "expected a JSON object with a 'roles' array."
+                    )
+                pages += 1
+                for role in payload["roles"]:
+                    if role.get("name") and role.get("id"):
+                        roles[role["name"].strip().lower()] = role["id"]
+                pagination = payload.get("pagination") or {}
+                if not pagination.get("has_more"):
+                    break
+                cursor = pagination.get("next_cursor")
+                if not cursor:  # defensive: no cursor means we can't advance
+                    break
+        except Exception as exc:
+            self._roles_error = exc
+            raise
+
+        self._roles_cache = roles
         self.logger.debug(
-            "  found %d custom role(s) in space %s: %s",
+            "  loaded %d role(s) across %d page(s): %s",
             len(roles),
-            space_id,
+            pages,
             ", ".join(sorted(roles)) or "(none)",
         )
+        if not roles:
+            self.logger.warning(
+                "Roles API returned no roles — any custom (non-built-in) "
+                "arize_space_role value will fail to resolve."
+            )
         return roles
 
-    def _resolve_custom_role(self, space_id: str, role_name: str) -> str:
+    def _resolve_custom_role(self, role_name: str) -> str:
         """Resolve a custom role name to its global ID, or raise if not found."""
-        roles = self._load_custom_roles_for_space(space_id)
+        roles = self._load_roles()
         role_id = roles.get(role_name.strip().lower())
         if role_id is None:
-            available = ", ".join(sorted(roles)) or "(none discoverable)"
+            available = ", ".join(sorted(roles)) or "(none found)"
             raise RuntimeError(
-                f"Custom role '{role_name}' was not found in this space. "
-                "Custom roles are discovered through users already assigned to "
-                "them in the space, so the role must be bound to at least one "
-                f"user there first. Discoverable custom roles: {available}."
+                f"Role '{role_name}' was not found in this account's role "
+                f"catalog (GET /v2/roles). Available roles: {available}."
             )
         return role_id
 
@@ -862,23 +894,11 @@ class BulkSetupRunner:
             )
 
             # 3. Resolve a custom RBAC space role to its global ID, if one was
-            #    named. Deferred to here because the lookup is space-scoped.
+            #    named. Roles are account-wide (REST /v2/roles), so this works
+            #    even for spaces that don't exist yet (dry run included).
             space_custom_role_id: Optional[str] = None
             if is_custom_space_role:
-                if self.dry_run and space_id.startswith("__dry_run_"):
-                    # New space in a dry run has no real ID to query against.
-                    space_custom_role_id = "__dry_run_custom_role__"
-                    self.logger.info(
-                        "[DRY RUN] Row %d: would resolve custom role '%s' "
-                        "in new space '%s'",
-                        row_number,
-                        arize_space_role,
-                        space_name,
-                    )
-                else:
-                    space_custom_role_id = self._resolve_custom_role(
-                        space_id, arize_space_role
-                    )
+                space_custom_role_id = self._resolve_custom_role(arize_space_role)
 
             # 4. SAML mapping
             self._load_saml_idp()
@@ -1094,6 +1114,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help=f"Arize app base URL (default: {ARIZE_APP_URL})",
     )
+    parser.add_argument(
+        "--arize-api-url",
+        default=None,
+        metavar="URL",
+        help=(
+            "Arize REST API base URL for the roles lookup (default: derived "
+            f"from --arize-url, e.g. {ARIZE_API_URL}). Set for custom hosts."
+        ),
+    )
 
     saml_group = parser.add_argument_group(
         "SAML IdP creation (only needed if no IdP is configured yet)"
@@ -1175,6 +1204,7 @@ def main() -> None:
         dry_run=args.dry_run,
         verbose=args.verbose,
         arize_app_url=args.arize_url,
+        arize_api_url=args.arize_api_url,
         saml_metadata_url=args.saml_metadata_url,
         saml_metadata_xml=args.saml_metadata_xml,
         email_domains=email_domains,

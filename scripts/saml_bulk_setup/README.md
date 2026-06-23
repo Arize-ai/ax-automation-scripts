@@ -68,9 +68,9 @@ Each **row** is one rule: “When a user’s SAML attribute matches this value, 
 
 #### Custom space roles
 
-`arize_space_role` also accepts the **name of a custom role** (an RBAC role you defined in Arize), not just the built-in keywords. If the value isn’t one of `admin` / `member` / `viewer` / `annotator`, the tool treats it as a custom role name and looks it up in that space (matching is case-insensitive). Custom roles apply at the **space** level only — `arize_org_role` must still be a built-in role.
+`arize_space_role` also accepts the **name of a custom role** (an RBAC role defined in Arize), not just the built-in keywords. If the value isn’t one of `admin` / `member` / `viewer` / `annotator`, the tool treats it as a custom role name and looks it up in your account’s **role catalog** via the Arize REST API (`GET /v2/roles`); matching is case-insensitive. Custom roles apply at the **space** level only — `arize_org_role` must still be a built-in role.
 
-> **Important — custom roles must already be in use.** Arize does not expose a way to list all custom roles by API, so the tool can only find a custom role by name if **at least one user is already assigned that role in that space**. If no one holds the role there yet, assign it to one user in the Arize UI first, then run the tool. Rows naming an undiscoverable role fail with a clear message listing the roles that *were* found.
+The lookup covers every role in the account (predefined and custom) **whether or not anyone is assigned to it yet**, so you can map a role before its first user. A row naming a role that isn’t in the catalog fails with a clear message listing the available role names.
 
 ### Example
 
@@ -145,6 +145,7 @@ The tool adds or updates **group-to-role mappings** on your existing SAML setup.
 | `--verbose` | More detailed messages per row (helpful when debugging). |
 | `--output PATH` | Where to write the results file (default: `saml_setup_results.csv`). |
 | `--arize-url URL` | Use a non-default Arize URL if your company uses a dedicated host (default is `https://app.arize.com`). |
+| `--arize-api-url URL` | REST API host used to look up custom roles (default: derived from `--arize-url`, e.g. `https://api.arize.com`). Set this only for custom/on-prem hosts where the API host isn’t `api.<your-app-host>`. |
 
 ---
 
@@ -197,7 +198,7 @@ If some rows fail, the summary tells you how many failed and points you to the r
 | --- | --- |
 | **Permission denied / forbidden** | Confirm your API key can manage organizations, spaces, and SAML. You may need an account-level administrator to create or rotate the key. |
 | **Invalid role** | `arize_org_role` must be `admin`, `member`, `viewer`, or `annotator`. For org **admin** rows, leave **`arize_space_role`** empty. |
-| **Custom role not found** | `arize_space_role` named a custom role the tool couldn’t find. Custom roles are discovered only through users already assigned to them **in that space**—assign the role to one user in the Arize UI first, then re-run. The error message lists the custom roles that were discoverable. |
+| **Custom role not found** | `arize_space_role` named a role that isn’t in your account’s role catalog (`GET /v2/roles`). Check spelling against the role’s name in Arize (matching is case-insensitive). The error message lists the available role names. If your account uses a custom host, set **`--arize-api-url`** so the lookup hits the right REST endpoint. |
 | **Errors creating SAML / “no IdP”** | For a **new** SAML setup, include **`--email-domains`** and **`--saml-metadata-url`** or **`--saml-metadata-xml`**. Alternatively, complete SAML setup once in the Arize **Settings** UI, then run again with only **`--csv`**. |
 | **Too many requests / slow** | The tool retries automatically. If it keeps failing, wait and run again with a smaller CSV or off-peak hours. |
 | **Users do not get the expected access** | Check that **`saml_attribute_name`** and **`saml_attribute_value`** exactly match what your IdP sends (including spelling and case, per your IdP’s behavior). Review failed rows in **`saml_setup_results.csv`**. |

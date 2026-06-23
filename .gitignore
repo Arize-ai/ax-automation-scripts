@@ -5,3 +5,4 @@
 main.py
 pyproject.toml
 __pycache__/
+.DS_Store
