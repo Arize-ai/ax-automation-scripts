@@ -1043,6 +1043,23 @@ class BulkSetupRunner:
                 for p in legacy_spaces
             ):
                 return True
+            # A prior run may have promoted this legacy role to its custom equivalent
+            # (spaceRolesMap → spaceRbacRolesMap). Check for that relay ID so re-runs
+            # correctly report already_exists instead of creating a duplicate.
+            if (
+                space_role
+                and not space_rbac_role_id
+                and space_role in _LEGACY_ROLE_EQUIVALENTS
+                and rbac_spaces
+            ):
+                self.roles._ensure_loaded()
+                equiv_name = _LEGACY_ROLE_EQUIVALENTS[space_role][0].lower()
+                equiv_id = self.roles._name_to_id.get(equiv_name, "")
+                if equiv_id and any(
+                    len(p) >= 2 and p[0] == space_id and p[1] == equiv_id
+                    for p in rbac_spaces
+                ):
+                    return True
         # Also deduplicate within the current run
         return any(
             p.attr_name == attr_name
