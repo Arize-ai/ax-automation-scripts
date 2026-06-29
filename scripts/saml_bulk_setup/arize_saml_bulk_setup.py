@@ -33,9 +33,6 @@ ARIZE_REST_API_URL = "https://api.arize.com"
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0  # seconds
 
-# Base64 prefix for relay global IDs of the form "Role:<int>".
-RELAY_ROLE_ID_PREFIX = "Um9sZTo"
-
 # CSV accepts "viewer" as a human-friendly alias; Arize GraphQL uses "readOnly"
 _ROLE_ALIAS: dict[str, str] = {
     "admin": "admin",
@@ -226,8 +223,6 @@ def with_retry(
 # Used to auto-create custom RBAC roles mirroring legacy space roles when a
 # same-space conflict forces promotion. Keys are the GraphQL form after
 # _ROLE_ALIAS translation: "admin" | "member" | "readOnly" | "annotator".
-# Permission strings match proto/auth/protocol/permissions.proto.
-# Source: go/pkg/lib/user/user.go lines 216-260 (as at 2026-05-15).
 
 _LEGACY_ROLE_EQUIVALENTS: dict[str, tuple[str, str, list[str]]] = {
     "admin": (
@@ -392,7 +387,7 @@ class RolesCache:
         validated against the cache.
         """
         self._ensure_loaded()
-        if role_value.startswith(RELAY_ROLE_ID_PREFIX) and role_value in self._role_ids:
+        if role_value in self._role_ids:
             return role_value
         rid = self._name_to_id.get(role_value.lower())
         if rid:
