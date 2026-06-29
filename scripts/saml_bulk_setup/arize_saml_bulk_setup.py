@@ -18,20 +18,18 @@ import csv
 import logging
 import os
 import sys
-import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional
 
-import requests
 from arize_toolkit import Client as ArizeClient
 from gql import gql
+
+from roles_cache import ARIZE_REST_API_URL, LEGACY_ROLE_EQUIVALENTS, RolesCache
+from utils import with_retry
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 ARIZE_APP_URL = "https://app.arize.com"
-ARIZE_REST_API_URL = "https://api.arize.com"
-MAX_RETRIES = 5
-INITIAL_BACKOFF = 1.0  # seconds
 
 # CSV accepts "viewer" as a human-friendly alias; Arize GraphQL uses "readOnly"
 _ROLE_ALIAS: dict[str, str] = {
@@ -185,328 +183,6 @@ class SamlFlags:
     allow_login_with_defaults: bool
 
 
-# ─── Retry helper ────────────────────────────────────────────────────────────
-
-T = TypeVar("T")
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return "429" in msg or "rate limit" in msg or "too many requests" in msg
-
-
-def with_retry(
-    fn: Callable[[], T],
-    operation_name: str,
-    logger: logging.Logger,
-) -> T:
-    """Call fn(), retrying with exponential backoff on rate-limit errors."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            return fn()
-        except Exception as exc:
-            if _is_rate_limit_error(exc) and attempt < MAX_RETRIES - 1:
-                wait = INITIAL_BACKOFF * (2**attempt)
-                logger.warning(
-                    "Rate limit hit for '%s' (attempt %d/%d). Retrying in %.1fs…",
-                    operation_name,
-                    attempt + 1,
-                    MAX_RETRIES,
-                    wait,
-                )
-                time.sleep(wait)
-            else:
-                raise
-
-
-# ─── Legacy role permission sets ─────────────────────────────────────────────
-# Used to auto-create custom RBAC roles mirroring legacy space roles when a
-# same-space conflict forces promotion. Keys are the GraphQL form after
-# _ROLE_ALIAS translation: "admin" | "member" | "readOnly" | "annotator".
-
-_LEGACY_ROLE_EQUIVALENTS: dict[str, tuple[str, str, list[str]]] = {
-    "admin": (
-        "Space Admin",
-        "Auto-created by saml_bulk_setup to mirror the legacy Admin space role.",
-        [
-            "PROJECT_READ",
-            "PROJECT_SPAN_READ",
-            "ML_MODEL_READ",
-            "DATASET_READ",
-            "DATASET_EXAMPLE_READ",
-            "EXPERIMENT_READ",
-            "ANNOTATION_CONFIG_READ",
-            "SPACE_READ",
-            "QUEUE_READ",
-            "QUEUE_RECORD_READ",
-            "ML_MODEL_CREATE",
-            "ML_MODEL_UPDATE",
-            "ML_MODEL_DELETE",
-            "PROJECT_CREATE",
-            "PROJECT_UPDATE",
-            "PROJECT_SPAN_CREATE",
-            "PROJECT_SPAN_UPDATE",
-            "PROJECT_SPAN_ANNOTATE",
-            "PROJECT_SPAN_DELETE",
-            "DATASET_CREATE",
-            "DATASET_UPDATE",
-            "DATASET_DELETE",
-            "DATASET_EXAMPLE_CREATE",
-            "DATASET_EXAMPLE_UPDATE",
-            "DATASET_EXAMPLE_DELETE",
-            "DATASET_EXAMPLE_ANNOTATE",
-            "EXPERIMENT_CREATE",
-            "EXPERIMENT_UPDATE",
-            "EXPERIMENT_DELETE",
-            "EXPERIMENT_RUN_ANNOTATE",
-            "ANNOTATION_CONFIG_CREATE",
-            "ANNOTATION_CONFIG_DELETE",
-            "SPACE_UPDATE",
-            "SPACE_DELETE",
-            "ROLE_BINDING_READ",
-            "ROLE_BINDING_CREATE",
-            "ROLE_BINDING_DELETE",
-            "QUEUE_CREATE",
-            "QUEUE_UPDATE",
-            "QUEUE_DELETE",
-            "QUEUE_RECORD_ANNOTATE",
-            "QUEUE_RECORD_CREATE",
-            "QUEUE_RECORD_UPDATE",
-            "QUEUE_RECORD_DELETE",
-            "PROJECT_RESTRICT",
-            "SERVICE_KEY_CREATE",
-            "SERVICE_KEY_READ",
-            "SERVICE_KEY_DELETE",
-        ],
-    ),
-    "member": (
-        "Space Member",
-        "Auto-created by saml_bulk_setup to mirror the legacy Member space role.",
-        [
-            "PROJECT_READ",
-            "PROJECT_SPAN_READ",
-            "ML_MODEL_READ",
-            "DATASET_READ",
-            "DATASET_EXAMPLE_READ",
-            "EXPERIMENT_READ",
-            "ANNOTATION_CONFIG_READ",
-            "SPACE_READ",
-            "QUEUE_READ",
-            "QUEUE_RECORD_READ",
-            "ML_MODEL_CREATE",
-            "ML_MODEL_UPDATE",
-            "PROJECT_CREATE",
-            "PROJECT_UPDATE",
-            "PROJECT_SPAN_CREATE",
-            "PROJECT_SPAN_UPDATE",
-            "PROJECT_SPAN_ANNOTATE",
-            "DATASET_CREATE",
-            "DATASET_UPDATE",
-            "DATASET_DELETE",
-            "DATASET_EXAMPLE_CREATE",
-            "DATASET_EXAMPLE_UPDATE",
-            "DATASET_EXAMPLE_DELETE",
-            "DATASET_EXAMPLE_ANNOTATE",
-            "EXPERIMENT_CREATE",
-            "EXPERIMENT_UPDATE",
-            "EXPERIMENT_DELETE",
-            "EXPERIMENT_RUN_ANNOTATE",
-            "ANNOTATION_CONFIG_CREATE",
-            "ANNOTATION_CONFIG_DELETE",
-            "QUEUE_CREATE",
-            "QUEUE_UPDATE",
-            "QUEUE_DELETE",
-            "QUEUE_RECORD_ANNOTATE",
-            "QUEUE_RECORD_CREATE",
-            "QUEUE_RECORD_UPDATE",
-            "QUEUE_RECORD_DELETE",
-            "SERVICE_KEY_CREATE",
-            "SERVICE_KEY_READ",
-            "SERVICE_KEY_DELETE",
-        ],
-    ),
-    "readOnly": (
-        "Space Read-Only",
-        "Auto-created by saml_bulk_setup to mirror the legacy Member - Read Only space role.",
-        [
-            "PROJECT_READ",
-            "PROJECT_SPAN_READ",
-            "ML_MODEL_READ",
-            "DATASET_READ",
-            "DATASET_EXAMPLE_READ",
-            "EXPERIMENT_READ",
-            "ANNOTATION_CONFIG_READ",
-            "SPACE_READ",
-            "QUEUE_READ",
-            "QUEUE_RECORD_READ",
-            "SERVICE_KEY_READ",
-        ],
-    ),
-    "annotator": (
-        "Space Annotator",
-        "Auto-created by saml_bulk_setup to mirror the legacy Annotator space role.",
-        [
-            "QUEUE_READ",
-            "QUEUE_RECORD_READ",
-            "QUEUE_RECORD_ANNOTATE",
-        ],
-    ),
-}
-
-
-# ─── RolesCache ───────────────────────────────────────────────────────────────
-
-
-class RolesCache:
-    """Resolve non-builtin space-role values to relay role IDs.
-
-    Loaded once on first reference via paginated GET /v2/roles, which returns
-    both predefined and custom roles for the authenticated account. Only
-    consulted when the CSV value didn't match a builtin alias.
-    """
-
-    def __init__(self, api_key: str, logger: logging.Logger) -> None:
-        self._api_key = api_key
-        self._logger = logger
-        self._name_to_id: dict[str, str] = {}
-        self._role_ids: set[str] = set()
-        self._loaded = False
-
-    def id_to_name(self, role_id: str) -> str:
-        """Return the human-readable name for a relay role ID, or the ID itself."""
-        self._ensure_loaded()
-        for name, rid in self._name_to_id.items():
-            if rid == role_id:
-                return name
-        return role_id
-
-    def resolve_custom_space_role(self, role_value: str) -> str:
-        """Resolve a non-builtin space role name (or relay ID) to a relay role ID.
-
-        Accepts either a role name (case-insensitive) or a relay global ID
-        validated against the cache.
-        """
-        self._ensure_loaded()
-        if role_value in self._role_ids:
-            return role_value
-        rid = self._name_to_id.get(role_value.lower())
-        if rid:
-            return rid
-        available = ", ".join(sorted(self._name_to_id.keys())) or "(none)"
-        raise ValueError(
-            f"Custom role '{role_value}' not found in this account. "
-            f"Available roles (case-insensitive): {available}"
-        )
-
-    def ensure_legacy_equivalent_role(self, legacy_role_key: str) -> tuple[str, str]:
-        """Get-or-create the custom role mirroring a legacy space role.
-
-        `legacy_role_key` is the GraphQL form: "admin" | "member" | "readOnly" |
-        "annotator". Returns (relay_role_id, custom_role_name). Idempotent: checks
-        the cache first, POSTs if missing, recovers from a 409 race condition.
-        """
-        if legacy_role_key not in _LEGACY_ROLE_EQUIVALENTS:
-            raise ValueError(
-                f"No legacy-equivalent permission set for '{legacy_role_key}'. "
-                f"Known keys: {sorted(_LEGACY_ROLE_EQUIVALENTS.keys())}"
-            )
-        name, description, permissions = _LEGACY_ROLE_EQUIVALENTS[legacy_role_key]
-
-        self._ensure_loaded()
-        cached_id = self._name_to_id.get(name.lower())
-        if cached_id:
-            return cached_id, name
-
-        relay_id = self._post_role(name, description, permissions)
-        if relay_id:
-            self._name_to_id[name.lower()] = relay_id
-            self._role_ids.add(relay_id)
-            self._logger.info(
-                "Auto-created custom role '%s' (id=%s) as legacy-%s equivalent",
-                name,
-                relay_id,
-                legacy_role_key,
-            )
-            return relay_id, name
-
-        # 409 race: someone else just created the role — reload and look it up.
-        self._loaded = False
-        self._name_to_id.clear()
-        self._role_ids.clear()
-        self._ensure_loaded()
-        racy_id = self._name_to_id.get(name.lower())
-        if not racy_id:
-            raise RuntimeError(
-                f"POST /v2/roles for '{name}' returned 409 but the role wasn't "
-                "visible after a cache reload. Re-run the script."
-            )
-        return racy_id, name
-
-    def _post_role(
-        self, name: str, description: str, permissions: list[str]
-    ) -> str | None:
-        """POST /v2/roles. Returns the new role's relay ID, or None on 409 Conflict."""
-        url = f"{ARIZE_REST_API_URL}/v2/roles"
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        body = {"name": name, "description": description, "permissions": permissions}
-
-        def post_role() -> requests.Response:
-            r = requests.post(url, headers=headers, json=body, timeout=30)
-            # 409 means the role already exists (race). Don't raise; caller handles it.
-            if r.status_code == 409:
-                return r
-            r.raise_for_status()
-            return r
-
-        resp = with_retry(post_role, f"POST /v2/roles ({name})", self._logger)
-        if resp.status_code == 409:
-            return None
-        payload = resp.json() or {}
-        role = payload.get("role") if isinstance(payload.get("role"), dict) else payload
-        rid = role.get("id") or ""
-        if not rid:
-            raise RuntimeError(f"POST /v2/roles for '{name}' returned no id: {payload}")
-        return rid
-
-    def _ensure_loaded(self) -> None:
-        """Populate the role cache via paginated GET /v2/roles. Idempotent."""
-        if self._loaded:
-            return
-        self._logger.debug("Loading account roles for custom-role lookup…")
-        url = f"{ARIZE_REST_API_URL}/v2/roles"
-        headers = {"Authorization": f"Bearer {self._api_key}"}
-        cursor: str | None = None
-        while True:
-            params: dict[str, Any] = {"limit": 100}
-            if cursor:
-                params["cursor"] = cursor
-
-            def fetch_page() -> requests.Response:
-                r = requests.get(url, headers=headers, params=params, timeout=30)
-                r.raise_for_status()
-                return r
-
-            resp = with_retry(fetch_page, "GET /v2/roles", self._logger)
-            payload = resp.json()
-            for role in payload.get("roles") or []:
-                rid = role.get("id") or ""
-                rname = role.get("name") or ""
-                if rid and rname:
-                    self._name_to_id[rname.lower()] = rid
-                    self._role_ids.add(rid)
-            pagination = payload.get("pagination") or {}
-            if not pagination.get("has_more"):
-                break
-            cursor = pagination.get("next_cursor")
-            if not cursor:
-                break
-        self._loaded = True
-        self._logger.debug("  loaded %d account role(s)", len(self._name_to_id))
-
-
 # ─── Space-role classification ────────────────────────────────────────────────
 
 
@@ -600,7 +276,7 @@ def _resolve_role_type_conflicts(
     row_errors: dict[int, str] = {}
 
     for space_id in conflict_space_ids:
-        space_name = runner._space_id_to_name.get(space_id, "<unknown>")
+        space_name = runner.space_name(space_id)
         legacy_entries = legacy_uses[space_id]
         rbac_entries = rbac_uses[space_id]
 
@@ -724,6 +400,7 @@ class BulkSetupRunner:
         dry_run: bool,
         verbose: bool,
         arize_app_url: str = ARIZE_APP_URL,
+        arize_rest_api_url: str = ARIZE_REST_API_URL,
         saml_metadata_url: Optional[str] = None,
         saml_metadata_xml: Optional[str] = None,
         email_domains: Optional[list[str]] = None,
@@ -753,7 +430,11 @@ class BulkSetupRunner:
         self._gql = self._toolkit._graphql_client
 
         # Roles cache for custom RBAC role resolution
-        self.roles = RolesCache(api_key=api_key, logger=self.logger)
+        self.roles = RolesCache(
+            api_key=api_key,
+            logger=self.logger,
+            arize_rest_api_url=arize_rest_api_url,
+        )
 
         # In-memory caches
         self._org_cache: dict[str, str] = {}  # org_name → org_id
@@ -820,6 +501,10 @@ class BulkSetupRunner:
     def pending_row_numbers(self) -> set[int]:
         return {p.row_number for p in self._saml_pending}
 
+    def space_name(self, space_id: str) -> str:
+        """Human-readable space name for conflict/error messages."""
+        return self._space_id_to_name.get(space_id, "<unknown>")
+
     def drop_pending(self, row_numbers: set[int]) -> None:
         self._saml_pending = [
             p for p in self._saml_pending if p.row_number not in row_numbers
@@ -852,7 +537,7 @@ class BulkSetupRunner:
             ):
                 legacy_key = p.space_role
                 if self.dry_run:
-                    custom_name = _LEGACY_ROLE_EQUIVALENTS[legacy_key][0]
+                    custom_name = LEGACY_ROLE_EQUIVALENTS[legacy_key][0]
                     p.space_rbac_role_id = f"__dry_run_role_{legacy_key}__"
                 else:
                     p.space_rbac_role_id, custom_name = (
@@ -881,7 +566,7 @@ class BulkSetupRunner:
                     continue
                 legacy_key = pair[1]
                 if self.dry_run:
-                    custom_name = _LEGACY_ROLE_EQUIVALENTS[legacy_key][0]
+                    custom_name = LEGACY_ROLE_EQUIVALENTS[legacy_key][0]
                     relay_id = f"__dry_run_role_{legacy_key}__"
                 else:
                     relay_id, custom_name = self.roles.ensure_legacy_equivalent_role(
@@ -1167,12 +852,10 @@ class BulkSetupRunner:
             if (
                 space_role
                 and not space_rbac_role_id
-                and space_role in _LEGACY_ROLE_EQUIVALENTS
+                and space_role in LEGACY_ROLE_EQUIVALENTS
                 and rbac_spaces
             ):
-                self.roles._ensure_loaded()
-                equiv_name = _LEGACY_ROLE_EQUIVALENTS[space_role][0].lower()
-                equiv_id = self.roles._name_to_id.get(equiv_name, "")
+                equiv_id = self.roles.legacy_equivalent_id(space_role)
                 if equiv_id and any(
                     len(p) >= 2 and p[0] == space_id and p[1] == equiv_id
                     for p in rbac_spaces
@@ -1666,6 +1349,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help=f"Arize app base URL (default: {ARIZE_APP_URL})",
     )
+    parser.add_argument(
+        "--arize-rest-url",
+        default=ARIZE_REST_API_URL,
+        metavar="URL",
+        help=f"Arize REST API base URL (default: {ARIZE_REST_API_URL})",
+    )
 
     saml_group = parser.add_argument_group(
         "SAML IdP creation (only needed if no IdP is configured yet)"
@@ -1747,6 +1436,7 @@ def main() -> None:
         dry_run=args.dry_run,
         verbose=args.verbose,
         arize_app_url=args.arize_url,
+        arize_rest_api_url=args.arize_rest_url,
         saml_metadata_url=args.saml_metadata_url,
         saml_metadata_xml=args.saml_metadata_xml,
         email_domains=email_domains,

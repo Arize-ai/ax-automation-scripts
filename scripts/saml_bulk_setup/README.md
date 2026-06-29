@@ -34,7 +34,7 @@ You do **not** need SAML already turned on in the Arize app. If your account doe
 
 ## Install
 
-1. Clone or download this repository (or copy `arize_saml_bulk_setup.py` and `requirements.txt` into a folder on your machine).
+1. Clone or download this repository (or copy `arize_saml_bulk_setup.py`, `roles_cache.py`, `utils.py`, and `requirements.txt` into a folder on your machine).
 2. Open a terminal in the `saml_bulk_setup` folder and run:
 
 ```bash
@@ -144,7 +144,8 @@ The tool adds or updates **group-to-role mappings** on your existing SAML setup.
 | --- | --- |
 | `--verbose` | More detailed messages per row (helpful when debugging). |
 | `--output PATH` | Where to write the results file (default: `saml_setup_results.csv`). |
-| `--arize-url URL` | Use a non-default Arize URL if your company uses a dedicated host (default is `https://app.arize.com`). |
+| `--arize-url URL` | Use a non-default Arize app URL for GraphQL operations (default is `https://app.arize.com`). Required for VPC/on-prem when the app host differs from SaaS. |
+| `--arize-rest-url URL` | Use a non-default REST API base URL for custom role lookups and creation (default is `https://api.arize.com`). Set this alongside `--arize-url` for VPC/on-prem when the API host differs from SaaS. |
 
 ---
 
