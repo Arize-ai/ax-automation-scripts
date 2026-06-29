@@ -44,7 +44,9 @@ _ROLE_ALIAS: dict[str, str] = {
     "annotator": "annotator",
 }
 
-VALID_ORG_ROLES: set[str] = set(_ROLE_ALIAS.keys())  # admin | member | viewer | annotator
+VALID_ORG_ROLES: set[str] = set(
+    _ROLE_ALIAS.keys()
+)  # admin | member | viewer | annotator
 
 OUTPUT_COLUMNS = [
     "organization",
@@ -232,50 +234,116 @@ _LEGACY_ROLE_EQUIVALENTS: dict[str, tuple[str, str, list[str]]] = {
         "Space Admin",
         "Auto-created by saml_bulk_setup to mirror the legacy Admin space role.",
         [
-            "PROJECT_READ", "PROJECT_SPAN_READ", "ML_MODEL_READ",
-            "DATASET_READ", "DATASET_EXAMPLE_READ", "EXPERIMENT_READ",
-            "ANNOTATION_CONFIG_READ", "SPACE_READ", "QUEUE_READ", "QUEUE_RECORD_READ",
-            "ML_MODEL_CREATE", "ML_MODEL_UPDATE", "ML_MODEL_DELETE",
-            "PROJECT_CREATE", "PROJECT_UPDATE",
-            "PROJECT_SPAN_CREATE", "PROJECT_SPAN_UPDATE", "PROJECT_SPAN_ANNOTATE", "PROJECT_SPAN_DELETE",
-            "DATASET_CREATE", "DATASET_UPDATE", "DATASET_DELETE",
-            "DATASET_EXAMPLE_CREATE", "DATASET_EXAMPLE_UPDATE", "DATASET_EXAMPLE_DELETE", "DATASET_EXAMPLE_ANNOTATE",
-            "EXPERIMENT_CREATE", "EXPERIMENT_UPDATE", "EXPERIMENT_DELETE", "EXPERIMENT_RUN_ANNOTATE",
-            "ANNOTATION_CONFIG_CREATE", "ANNOTATION_CONFIG_DELETE",
-            "SPACE_UPDATE", "SPACE_DELETE",
-            "ROLE_BINDING_READ", "ROLE_BINDING_CREATE", "ROLE_BINDING_DELETE",
-            "QUEUE_CREATE", "QUEUE_UPDATE", "QUEUE_DELETE",
-            "QUEUE_RECORD_ANNOTATE", "QUEUE_RECORD_CREATE", "QUEUE_RECORD_UPDATE", "QUEUE_RECORD_DELETE",
+            "PROJECT_READ",
+            "PROJECT_SPAN_READ",
+            "ML_MODEL_READ",
+            "DATASET_READ",
+            "DATASET_EXAMPLE_READ",
+            "EXPERIMENT_READ",
+            "ANNOTATION_CONFIG_READ",
+            "SPACE_READ",
+            "QUEUE_READ",
+            "QUEUE_RECORD_READ",
+            "ML_MODEL_CREATE",
+            "ML_MODEL_UPDATE",
+            "ML_MODEL_DELETE",
+            "PROJECT_CREATE",
+            "PROJECT_UPDATE",
+            "PROJECT_SPAN_CREATE",
+            "PROJECT_SPAN_UPDATE",
+            "PROJECT_SPAN_ANNOTATE",
+            "PROJECT_SPAN_DELETE",
+            "DATASET_CREATE",
+            "DATASET_UPDATE",
+            "DATASET_DELETE",
+            "DATASET_EXAMPLE_CREATE",
+            "DATASET_EXAMPLE_UPDATE",
+            "DATASET_EXAMPLE_DELETE",
+            "DATASET_EXAMPLE_ANNOTATE",
+            "EXPERIMENT_CREATE",
+            "EXPERIMENT_UPDATE",
+            "EXPERIMENT_DELETE",
+            "EXPERIMENT_RUN_ANNOTATE",
+            "ANNOTATION_CONFIG_CREATE",
+            "ANNOTATION_CONFIG_DELETE",
+            "SPACE_UPDATE",
+            "SPACE_DELETE",
+            "ROLE_BINDING_READ",
+            "ROLE_BINDING_CREATE",
+            "ROLE_BINDING_DELETE",
+            "QUEUE_CREATE",
+            "QUEUE_UPDATE",
+            "QUEUE_DELETE",
+            "QUEUE_RECORD_ANNOTATE",
+            "QUEUE_RECORD_CREATE",
+            "QUEUE_RECORD_UPDATE",
+            "QUEUE_RECORD_DELETE",
             "PROJECT_RESTRICT",
-            "SERVICE_KEY_CREATE", "SERVICE_KEY_READ", "SERVICE_KEY_DELETE",
+            "SERVICE_KEY_CREATE",
+            "SERVICE_KEY_READ",
+            "SERVICE_KEY_DELETE",
         ],
     ),
     "member": (
         "Space Member",
         "Auto-created by saml_bulk_setup to mirror the legacy Member space role.",
         [
-            "PROJECT_READ", "PROJECT_SPAN_READ", "ML_MODEL_READ",
-            "DATASET_READ", "DATASET_EXAMPLE_READ", "EXPERIMENT_READ",
-            "ANNOTATION_CONFIG_READ", "SPACE_READ", "QUEUE_READ", "QUEUE_RECORD_READ",
-            "ML_MODEL_CREATE", "ML_MODEL_UPDATE",
-            "PROJECT_CREATE", "PROJECT_UPDATE",
-            "PROJECT_SPAN_CREATE", "PROJECT_SPAN_UPDATE", "PROJECT_SPAN_ANNOTATE",
-            "DATASET_CREATE", "DATASET_UPDATE", "DATASET_DELETE",
-            "DATASET_EXAMPLE_CREATE", "DATASET_EXAMPLE_UPDATE", "DATASET_EXAMPLE_DELETE", "DATASET_EXAMPLE_ANNOTATE",
-            "EXPERIMENT_CREATE", "EXPERIMENT_UPDATE", "EXPERIMENT_DELETE", "EXPERIMENT_RUN_ANNOTATE",
-            "ANNOTATION_CONFIG_CREATE", "ANNOTATION_CONFIG_DELETE",
-            "QUEUE_CREATE", "QUEUE_UPDATE", "QUEUE_DELETE",
-            "QUEUE_RECORD_ANNOTATE", "QUEUE_RECORD_CREATE", "QUEUE_RECORD_UPDATE", "QUEUE_RECORD_DELETE",
-            "SERVICE_KEY_CREATE", "SERVICE_KEY_READ", "SERVICE_KEY_DELETE",
+            "PROJECT_READ",
+            "PROJECT_SPAN_READ",
+            "ML_MODEL_READ",
+            "DATASET_READ",
+            "DATASET_EXAMPLE_READ",
+            "EXPERIMENT_READ",
+            "ANNOTATION_CONFIG_READ",
+            "SPACE_READ",
+            "QUEUE_READ",
+            "QUEUE_RECORD_READ",
+            "ML_MODEL_CREATE",
+            "ML_MODEL_UPDATE",
+            "PROJECT_CREATE",
+            "PROJECT_UPDATE",
+            "PROJECT_SPAN_CREATE",
+            "PROJECT_SPAN_UPDATE",
+            "PROJECT_SPAN_ANNOTATE",
+            "DATASET_CREATE",
+            "DATASET_UPDATE",
+            "DATASET_DELETE",
+            "DATASET_EXAMPLE_CREATE",
+            "DATASET_EXAMPLE_UPDATE",
+            "DATASET_EXAMPLE_DELETE",
+            "DATASET_EXAMPLE_ANNOTATE",
+            "EXPERIMENT_CREATE",
+            "EXPERIMENT_UPDATE",
+            "EXPERIMENT_DELETE",
+            "EXPERIMENT_RUN_ANNOTATE",
+            "ANNOTATION_CONFIG_CREATE",
+            "ANNOTATION_CONFIG_DELETE",
+            "QUEUE_CREATE",
+            "QUEUE_UPDATE",
+            "QUEUE_DELETE",
+            "QUEUE_RECORD_ANNOTATE",
+            "QUEUE_RECORD_CREATE",
+            "QUEUE_RECORD_UPDATE",
+            "QUEUE_RECORD_DELETE",
+            "SERVICE_KEY_CREATE",
+            "SERVICE_KEY_READ",
+            "SERVICE_KEY_DELETE",
         ],
     ),
     "readOnly": (
         "Space Read-Only",
         "Auto-created by saml_bulk_setup to mirror the legacy Member - Read Only space role.",
         [
-            "PROJECT_READ", "PROJECT_SPAN_READ", "ML_MODEL_READ",
-            "DATASET_READ", "DATASET_EXAMPLE_READ", "EXPERIMENT_READ",
-            "ANNOTATION_CONFIG_READ", "SPACE_READ", "QUEUE_READ", "QUEUE_RECORD_READ",
+            "PROJECT_READ",
+            "PROJECT_SPAN_READ",
+            "ML_MODEL_READ",
+            "DATASET_READ",
+            "DATASET_EXAMPLE_READ",
+            "EXPERIMENT_READ",
+            "ANNOTATION_CONFIG_READ",
+            "SPACE_READ",
+            "QUEUE_READ",
+            "QUEUE_RECORD_READ",
             "SERVICE_KEY_READ",
         ],
     ),
@@ -283,7 +351,9 @@ _LEGACY_ROLE_EQUIVALENTS: dict[str, tuple[str, str, list[str]]] = {
         "Space Annotator",
         "Auto-created by saml_bulk_setup to mirror the legacy Annotator space role.",
         [
-            "QUEUE_READ", "QUEUE_RECORD_READ", "QUEUE_RECORD_ANNOTATE",
+            "QUEUE_READ",
+            "QUEUE_RECORD_READ",
+            "QUEUE_RECORD_ANNOTATE",
         ],
     ),
 }
@@ -358,7 +428,9 @@ class RolesCache:
             self._role_ids.add(relay_id)
             self._logger.info(
                 "Auto-created custom role '%s' (id=%s) as legacy-%s equivalent",
-                name, relay_id, legacy_role_key,
+                name,
+                relay_id,
+                legacy_role_key,
             )
             return relay_id, name
 
@@ -375,7 +447,9 @@ class RolesCache:
             )
         return racy_id, name
 
-    def _post_role(self, name: str, description: str, permissions: list[str]) -> str | None:
+    def _post_role(
+        self, name: str, description: str, permissions: list[str]
+    ) -> str | None:
         """POST /v2/roles. Returns the new role's relay ID, or None on 409 Conflict."""
         url = f"{ARIZE_REST_API_URL}/v2/roles"
         headers = {
@@ -536,16 +610,32 @@ def _resolve_role_type_conflicts(
         rbac_entries = rbac_uses[space_id]
 
         pending_legacy_rows = sorted(
-            {row for row, _ in legacy_entries if row is not None and row in pending_row_numbers}
+            {
+                row
+                for row, _ in legacy_entries
+                if row is not None and row in pending_row_numbers
+            }
         )
         matched_legacy_rows = sorted(
-            {row for row, _ in legacy_entries if row is not None and row not in pending_row_numbers}
+            {
+                row
+                for row, _ in legacy_entries
+                if row is not None and row not in pending_row_numbers
+            }
         )
         pending_rbac_rows = sorted(
-            {row for row, _ in rbac_entries if row is not None and row in pending_row_numbers}
+            {
+                row
+                for row, _ in rbac_entries
+                if row is not None and row in pending_row_numbers
+            }
         )
         matched_rbac_rows = sorted(
-            {row for row, _ in rbac_entries if row is not None and row not in pending_row_numbers}
+            {
+                row
+                for row, _ in rbac_entries
+                if row is not None and row not in pending_row_numbers
+            }
         )
         has_existing_legacy = any(row is None for row, _ in legacy_entries)
 
@@ -562,7 +652,10 @@ def _resolve_role_type_conflicts(
                 on_legacy_converted(row, legacy_key, custom_name, "pending")
                 logger.info(
                     "Row %d: auto-converted legacy '%s' → custom role '%s' (space '%s')",
-                    row, legacy_key, custom_name, space_name,
+                    row,
+                    legacy_key,
+                    custom_name,
+                    space_name,
                 )
 
             # 2. Promote pre-existing IdP legacy entries for this space.
@@ -571,7 +664,9 @@ def _resolve_role_type_conflicts(
                 for legacy_key, custom_name in conversions:
                     logger.info(
                         "Auto-promoted existing legacy '%s' → custom role '%s' on space '%s'",
-                        legacy_key, custom_name, space_name,
+                        legacy_key,
+                        custom_name,
+                        space_name,
                     )
                 # Annotate matched (already_exists) rows whose entry was just promoted.
                 if conversions and matched_legacy_rows:
@@ -581,12 +676,16 @@ def _resolve_role_type_conflicts(
 
         except Exception:
             logger.exception(
-                "Failed to auto-promote legacy roles for space '%s' (%s)", space_name, space_id
+                "Failed to auto-promote legacy roles for space '%s' (%s)",
+                space_name,
+                space_id,
             )
 
             def _describe(rows: list[int]) -> str:
                 return (
-                    ", ".join(f"row {r} ('{row_to_user_role.get(r, '')}')" for r in rows)
+                    ", ".join(
+                        f"row {r} ('{row_to_user_role.get(r, '')}')" for r in rows
+                    )
                     or "(none)"
                 )
 
@@ -597,7 +696,12 @@ def _resolve_role_type_conflicts(
                 f"custom role in {_describe(pending_rbac_rows + matched_rbac_rows)}. "
                 f"Auto-promotion failed — edit the CSV so this space uses one role type only."
             )
-            for row in pending_legacy_rows + pending_rbac_rows + matched_legacy_rows + matched_rbac_rows:
+            for row in (
+                pending_legacy_rows
+                + pending_rbac_rows
+                + matched_legacy_rows
+                + matched_rbac_rows
+            ):
                 row_errors[row] = message
 
     if not row_errors:
@@ -659,9 +763,13 @@ class BulkSetupRunner:
         # In-memory caches
         self._org_cache: dict[str, str] = {}  # org_name → org_id
         self._org_cache_loaded = False
-        self._space_cache: dict[tuple[str, str], str] = {}  # (org_id, space_name) → space_id
+        self._space_cache: dict[
+            tuple[str, str], str
+        ] = {}  # (org_id, space_name) → space_id
         self._spaces_loaded_for: set[str] = set()  # org_ids already fetched
-        self._space_id_to_name: dict[str, str] = {}  # space_id → space_name (for conflict messages)
+        self._space_id_to_name: dict[
+            str, str
+        ] = {}  # space_id → space_name (for conflict messages)
 
         # SAML IdP creation params (used if no IdP exists yet)
         self._saml_metadata_url = saml_metadata_url
@@ -718,16 +826,22 @@ class BulkSetupRunner:
         return {p.row_number for p in self._saml_pending}
 
     def drop_pending(self, row_numbers: set[int]) -> None:
-        self._saml_pending = [p for p in self._saml_pending if p.row_number not in row_numbers]
+        self._saml_pending = [
+            p for p in self._saml_pending if p.row_number not in row_numbers
+        ]
 
     def record_exact_match(
         self, row_number: int, space_id: str, space_role: str, space_rbac_role_id: str
     ) -> None:
         """Track a row that matched an existing mapping exactly (already_exists)."""
         if space_role or space_rbac_role_id:
-            self._saml_exact_match_uses.append((row_number, space_id, space_role, space_rbac_role_id))
+            self._saml_exact_match_uses.append(
+                (row_number, space_id, space_role, space_rbac_role_id)
+            )
 
-    def convert_legacy_to_custom(self, row_number: int, space_id: str) -> tuple[str, str] | None:
+    def convert_legacy_to_custom(
+        self, row_number: int, space_id: str
+    ) -> tuple[str, str] | None:
         """Swap a pending legacy mapping to use a custom role in-place.
 
         Returns (legacy_key, new_custom_role_name), or None if no matching
@@ -746,7 +860,9 @@ class BulkSetupRunner:
                     custom_name = _LEGACY_ROLE_EQUIVALENTS[legacy_key][0]
                     p.space_rbac_role_id = f"__dry_run_role_{legacy_key}__"
                 else:
-                    p.space_rbac_role_id, custom_name = self.roles.ensure_legacy_equivalent_role(legacy_key)
+                    p.space_rbac_role_id, custom_name = (
+                        self.roles.ensure_legacy_equivalent_role(legacy_key)
+                    )
                 p.space_role = ""
                 return legacy_key, custom_name
         return None
@@ -773,10 +889,17 @@ class BulkSetupRunner:
                     custom_name = _LEGACY_ROLE_EQUIVALENTS[legacy_key][0]
                     relay_id = f"__dry_run_role_{legacy_key}__"
                 else:
-                    relay_id, custom_name = self.roles.ensure_legacy_equivalent_role(legacy_key)
+                    relay_id, custom_name = self.roles.ensure_legacy_equivalent_role(
+                        legacy_key
+                    )
                 conversions[legacy_key] = custom_name
-                rbac_entries: list[list[str]] = mapping.setdefault("spaceRbacRolesMap", []) or []
-                if not any(len(e) >= 2 and e[0] == space_id and e[1] == relay_id for e in rbac_entries):
+                rbac_entries: list[list[str]] = (
+                    mapping.setdefault("spaceRbacRolesMap", []) or []
+                )
+                if not any(
+                    len(e) >= 2 and e[0] == space_id and e[1] == relay_id
+                    for e in rbac_entries
+                ):
                     rbac_entries.append([space_id, relay_id])
                 mapping["spaceRbacRolesMap"] = rbac_entries
             mapping["spaceRolesMap"] = kept
@@ -1072,7 +1195,9 @@ class BulkSetupRunner:
                     and p.space_id == space_id
                     and p.space_rbac_role_id == space_rbac_role_id
                 )
-                or (space_role and p.space_id == space_id and p.space_role == space_role)
+                or (
+                    space_role and p.space_id == space_id and p.space_role == space_role
+                )
             )
             for p in self._saml_pending
         )
@@ -1149,12 +1274,14 @@ class BulkSetupRunner:
             "emailDomainsList": [{"domain": d} for d in email_domains_for_update],
         }
         if self._saml_flags:
-            update_input.update({
-                "enforceSaml": self._saml_flags.enforce_saml,
-                "syncUserRoles": self._saml_flags.sync_user_roles,
-                "signAuthn": self._saml_flags.sign_authn,
-                "allowLoginWithDefaults": self._saml_flags.allow_login_with_defaults,
-            })
+            update_input.update(
+                {
+                    "enforceSaml": self._saml_flags.enforce_saml,
+                    "syncUserRoles": self._saml_flags.sync_user_roles,
+                    "signAuthn": self._saml_flags.sign_authn,
+                    "allowLoginWithDefaults": self._saml_flags.allow_login_with_defaults,
+                }
+            )
         result = with_retry(
             lambda: self._gql.execute(
                 _UPDATE_SAML_IDP,
@@ -1256,7 +1383,10 @@ class BulkSetupRunner:
                     self.spaces_existed += 1
             self.logger.debug(
                 "Row %d: space '%s' — %s (%s)",
-                row_number, space_name, space_status, space_id,
+                row_number,
+                space_name,
+                space_status,
+                space_id,
             )
 
             # 3. SAML mapping
@@ -1285,30 +1415,49 @@ class BulkSetupRunner:
                     return result
 
             if self._mapping_exists(
-                space_id, org_role, space_role, space_rbac_role_id, attr_name, attr_value
+                space_id,
+                org_role,
+                space_role,
+                space_rbac_role_id,
+                attr_name,
+                attr_value,
             ):
                 self.mappings_existed += 1
                 result.status = "already_exists"
-                self.record_exact_match(row_number, space_id, space_role, space_rbac_role_id)
+                self.record_exact_match(
+                    row_number, space_id, space_role, space_rbac_role_id
+                )
                 self.logger.debug(
                     "Row %d: SAML mapping (%s=%s → %s, org:%s/space:%s) already exists — skipping",
-                    row_number, attr_name, attr_value, space_name,
-                    arize_org_role, arize_space_role_raw or "n/a",
+                    row_number,
+                    attr_name,
+                    attr_value,
+                    space_name,
+                    arize_org_role,
+                    arize_space_role_raw or "n/a",
                 )
             else:
                 if self.dry_run:
                     self.logger.info(
                         "[DRY RUN] Row %d: Would create SAML mapping (%s=%s → %s, org:%s/space:%s)",
-                        row_number, attr_name, attr_value, space_name,
-                        arize_org_role, arize_space_role_raw or "n/a",
+                        row_number,
+                        attr_name,
+                        attr_value,
+                        space_name,
+                        arize_org_role,
+                        arize_space_role_raw or "n/a",
                     )
                     result.status = "dry_run"
                 else:
                     result.status = "created"
                     self.logger.debug(
                         "Row %d: SAML mapping (%s=%s → %s, org:%s/space:%s) queued",
-                        row_number, attr_name, attr_value, space_name,
-                        arize_org_role, arize_space_role_raw or "n/a",
+                        row_number,
+                        attr_name,
+                        attr_value,
+                        space_name,
+                        arize_org_role,
+                        arize_space_role_raw or "n/a",
                     )
                 self._saml_pending.append(
                     PendingSAMLMapping(
