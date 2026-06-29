@@ -34,7 +34,7 @@ You do **not** need SAML already turned on in the Arize app. If your account doe
 
 ## Install
 
-1. Clone or download this repository (or copy `arize_saml_bulk_setup.py` and `requirements.txt` into a folder on your machine).
+1. Clone or download this repository (or copy `arize_saml_bulk_setup.py`, `roles_cache.py`, `utils.py`, and `requirements.txt` into a folder on your machine).
 2. Open a terminal in the `saml_bulk_setup` folder and run:
 
 ```bash
@@ -66,6 +66,12 @@ Each **row** is one rule: “When a user’s SAML attribute matches this value, 
 
 `viewer` in the file is accepted; Arize stores it as read-only access.
 
+### Custom RBAC space roles
+
+In addition to the four standard roles, **`arize_space_role`** accepts the name of any **custom role** configured on your Arize account (for example `Reviewer`, `Testing Custom Roles`). The name is **case-insensitive** and must match exactly what appears in your Arize account’s role list.
+
+Custom roles use Arize’s RBAC system and are sent to the IdP under `spaceRbacRolesMap` instead of `spaceRolesMap`. A space can use **either** standard roles or custom roles across all mappings — not both. If your CSV mixes the two on the same space, the tool will **automatically promote** the standard-role rows to their custom-role equivalents (Space Admin, Space Member, Space Read-Only, Space Annotator) so the run can proceed. Promoted rows are noted in the results file under the `note` column.
+
 ### Example
 
 ```csv
@@ -73,7 +79,10 @@ organization,space,arize_org_role,arize_space_role,saml_attribute_name,saml_attr
 Acme Corp,ML Platform,admin,,groups,arize-admins
 Acme Corp,ML Platform,member,admin,groups,arize-ml-engineers
 Acme Corp,Fraud Detection,member,,groups,arize-fraud-team
+Acme Corp,NLP Research,member,Reviewer,groups,arize-nlp-leads
 ```
+
+The last row uses a custom role called `Reviewer`. If a standard role (e.g. `admin`) is also mapped to `NLP Research` in the same CSV, the tool auto-promotes it to the `Space Admin` custom role equivalent.
 
 ---
 
@@ -135,7 +144,8 @@ The tool adds or updates **group-to-role mappings** on your existing SAML setup.
 | --- | --- |
 | `--verbose` | More detailed messages per row (helpful when debugging). |
 | `--output PATH` | Where to write the results file (default: `saml_setup_results.csv`). |
-| `--arize-url URL` | Use a non-default Arize URL if your company uses a dedicated host (default is `https://app.arize.com`). |
+| `--arize-url URL` | Use a non-default Arize app URL for GraphQL operations (default is `https://app.arize.com`). Required for VPC/on-prem when the app host differs from SaaS. |
+| `--arize-rest-url URL` | Use a non-default REST API base URL for custom role lookups and creation (default is `https://api.arize.com`). Set this alongside `--arize-url` for VPC/on-prem when the API host differs from SaaS. |
 
 ---
 
@@ -158,7 +168,8 @@ If the service is busy, the tool **retries** automatically when it hits rate lim
 By default the tool creates **`saml_setup_results.csv`** next to your command (or the path you pass with `--output`). It contains your original columns plus:
 
 - **`status`** — whether that row was applied (`created`), already in place (`already_exists`), failed (`error`), or only simulated (`dry_run` if you used `--dry-run`).  
-- **`error_message`** — short reason when a row failed.
+- **`error_message`** — short reason when a row failed.  
+- **`note`** — advisory details for non-error rows, such as when a standard role was auto-promoted to a custom role equivalent.
 
 ### Exit code
 
@@ -174,9 +185,12 @@ Summary
   Organizations : 1 created, 2 already existed
   Spaces        : 3 created, 5 already existed
   SAML mappings : 4 created, 2 already existed
+  Auto-promoted : 1 legacy role(s) converted to custom
   Errors        : 0
 ──────────────────────────────────────────────────
 ```
+
+The `Auto-promoted` line only appears when the tool converted standard roles to custom equivalents to resolve a same-space conflict.
 
 If some rows fail, the summary tells you how many failed and points you to the results CSV.
 
@@ -187,7 +201,9 @@ If some rows fail, the summary tells you how many failed and points you to the r
 | What you see | What to try |
 | --- | --- |
 | **Permission denied / forbidden** | Confirm your API key can manage organizations, spaces, and SAML. You may need an account-level administrator to create or rotate the key. |
-| **Invalid role** | Use only `admin`, `member`, `viewer`, or `annotator` for roles. For org **admin** rows, leave **`arize_space_role`** empty. |
+| **Invalid role** | Use only `admin`, `member`, `viewer`, or `annotator` for standard roles, or the exact name of a custom role in your account. For org **admin** rows, leave **`arize_space_role`** empty. |
+| **Custom role not found** | The value in `arize_space_role` didn't match any role on your account. Check the exact name (case-insensitive) in Arize **Settings → Roles**. In `--dry-run` mode the row is warned but not failed, so you can verify names before a live run. |
+| **Mixed standard and custom roles on a space** | Arize enforces one role type per space across all SAML mappings. The tool auto-promotes standard-role rows to their custom equivalents when a conflict is detected. If auto-promotion fails (e.g. role creation is not permitted), edit the CSV so the space uses one type consistently. |
 | **Errors creating SAML / “no IdP”** | For a **new** SAML setup, include **`--email-domains`** and **`--saml-metadata-url`** or **`--saml-metadata-xml`**. Alternatively, complete SAML setup once in the Arize **Settings** UI, then run again with only **`--csv`**. |
 | **Too many requests / slow** | The tool retries automatically. If it keeps failing, wait and run again with a smaller CSV or off-peak hours. |
 | **Users do not get the expected access** | Check that **`saml_attribute_name`** and **`saml_attribute_value`** exactly match what your IdP sends (including spelling and case, per your IdP’s behavior). Review failed rows in **`saml_setup_results.csv`**. |
